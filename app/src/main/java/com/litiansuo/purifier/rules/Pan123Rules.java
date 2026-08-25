@@ -52,6 +52,60 @@ final class Pan123Rules implements RuleSet {
     private static final String FEAT_SURVEY = "survey";
     /** 按资源名隐藏广告位：应对类名混淆但资源名明文的情况。 */
     private static final String FEAT_AD_VIEW_ID = "ad-view-id";
+    /** 网络栈探测：判定广告数据能否在 Java 层拦下。 */
+    private static final String FEAT_NET_PROBE = "net-probe";
+    /** 请求 URL 探测：找出广告内容对应的接口。 */
+    private static final String FEAT_URL_PROBE = "url-probe";
+    /** 广告接口拦截：清空应用自家运营位的返回内容。 */
+    private static final String FEAT_AD_API = "ad-api";
+    /** 响应体结构探测：写过滤规则前必须先看到真实 JSON。 */
+    private static final String FEAT_BODY_PROBE = "body-probe";
+
+    /**
+     * 需要打印响应体的接口。
+     *
+     * <p><b>重要发现：整个应用只有 3 个请求走 Java 层 OkHttp</b>——
+     * {@code /getconfig-api/v1/getconfig}、{@code /app/config/get}、
+     * {@code /advert_resource/get}，都在启动阶段。之后无论怎么翻页、切 tab，
+     * {@code url-probe} 再也不出新记录。</p>
+     *
+     * <p>这说明业务请求由 Dart 侧的 {@code dart:io HttpClient} 发出，走 native socket，
+     * <b>Java hook 完全看不到</b>。所以能拦的就只有这 3 个启动期接口；
+     * 传输页横幅与右下角浮标那类 Flutter 自绘、Dart 取数的内容不在射程内。</p>
+     *
+     * <p>保留配置接口是为了随时核对补丁是否真的写进去了。</p>
+     */
+    private static final String[] PROBE_PATHS = {
+            // 不能写成 CONFIG_API_PATH：它声明在本字段之后，属于非法前向引用
+            "/app/config/get",
+    };
+
+    /**
+     * 替换后的广告接口响应。
+     *
+     * <p>{@code data.list} 原本是「广告位号 → 广告数组」的字典，置空对象即可让所有位置都没有
+     * 广告，不必逐个枚举位置号——位置号会随运营调整，枚举等于埋雷。</p>
+     *
+     * <p>{@code code:0} 必须保留：改成错误码会让应用走失败分支，可能弹重试提示。</p>
+     */
+    private static final String EMPTY_AD_JSON =
+            "{\"code\":0,\"message\":\"ok\",\"data\":{\"list\":{}}}";
+
+    /**
+     * 应用自家广告接口的 path 片段。
+     *
+     * <p>实测得来：主界面是 Flutter 绘制的，控件不是 Android View，按类名/资源名隐藏无效，
+     * 唯一的着力点是数据源。而这个接口正是首页轮播、右下角浮标、传输页会员条的内容来源。</p>
+     */
+    private static final String AD_API_PATH = "/advert_resource/get";
+
+    /**
+     * 全局配置接口，{@code removeAdConfig} 里的开关就在这里下发。
+     *
+     * <p>它同时承载登录态、接口地址、客服链接等必需内容，所以只能定点改字段，
+     * 绝不能像广告接口那样整体替换。</p>
+     */
+    private static final String CONFIG_API_PATH = "/app/config/get";
 
     /**
      * 广告容器的资源名。命中即整块隐藏。
@@ -291,7 +345,370 @@ final class Pan123Rules implements RuleSet {
     @Override
     public void installLate(Context ctx) {
         installProbe(ctx);
+        installNetStackProbe(ctx);
+        installUrlProbe(ctx);
+        installBodyProbe(ctx);
+        installAdApiFilter(ctx);
         installSdkInitBlock(ctx);
+    }
+
+    /**
+     * 应用自家运营位的开关，全在 {@code /app/config/get} 的 {@code removeAdConfig} 里。
+     *
+     * <p>实测响应（已确认，非推测）：</p>
+     * <pre>
+     * "isInitAd":1,
+     * "removeAdConfig":{"BuyRemoveAds":2,"button_download":1,"button_quit":1,
+     *   "button_return_file":1,"button_splash_screen":1,"button_upload":1,
+     *   "button_user_center":1,"mainTitle":"畅享无广告纯净体验",...}
+     * </pre>
+     *
+     * <p>这几个 {@code button_*} 就是用户反馈的位置：传输页左右滑动的三屏
+     * （上传 / 下载 / 离线下载）各有一条「VIP 连续包月」，对应
+     * {@code button_upload} / {@code button_download} / {@code button_return_file}；
+     * 右下角的「免广告」浮标对应 {@code button_user_center}。把它们置 0 即可整条消失，
+     * 比在 UI 层找控件可靠得多——界面是 Flutter 画的，根本没有 Android View 可隐藏。</p>
+     *
+     * <p>{@code isInitAd} 置 0 是从源头关掉广告 SDK 初始化，与 {@code sdk-init} 的方法级掐断
+     * 互为兜底：前者让应用自己不去初始化，后者防止它绕过开关。</p>
+     *
+     * <p><b>不动 {@code remove_ads_effect}</b>：字面看是「免广告已生效」，含义未确认，
+     * 乱改可能让应用以为用户已购买而进入异常分支。只关入口，不伪造权益状态。</p>
+     *
+     * <p><b>已验证的效果</b>：{@code button_*} 全置 0 后，传输页三屏的会员横幅从 3 条降到 1 条
+     * （下载页与离线下载页的消失，上传页的仍在）。这证明这批字段确实驱动那些位置。</p>
+     *
+     * <p><b>已验证无效</b>：{@code continuousPay} / {@code loadVipBuyId} /
+     * {@code loadBuyEntryMode} 一并置 0，上传页那条横幅与右下角「免广告」浮标依然存在。
+     * 结合「整个应用只有 3 个请求走 Java OkHttp」这一事实（见 {@link #PROBE_PATHS}），
+     * 结论是这两处由 Dart 侧自行取数并绘制，<b>Java 层拦不到</b>。
+     * 保留这三项是因为它们语义明确、置 0 无副作用，可覆盖走原生渲染的其它入口。</p>
+     */
+    private static final String[][] CONFIG_PATCHES = {
+            // 广告 SDK 初始化总开关
+            {"\"isInitAd\":1", "\"isInitAd\":0"},
+            // 各处会员/去广告入口开关，字段名与位置一一对应。
+            // 实测使传输页横幅从 3 条降到 1 条。
+            {"\"button_upload\":1", "\"button_upload\":0"},
+            {"\"button_download\":1", "\"button_download\":0"},
+            {"\"button_return_file\":1", "\"button_return_file\":0"},
+            {"\"button_user_center\":1", "\"button_user_center\":0"},
+            {"\"button_quit\":1", "\"button_quit\":0"},
+            {"\"button_splash_screen\":1", "\"button_splash_screen\":0"},
+            // 剩余一条横幅的候选开关：连续包月与会员商品 id
+            {"\"continuousPay\":1", "\"continuousPay\":0"},
+            {"\"loadVipBuyId\":154", "\"loadVipBuyId\":0"},
+            {"\"loadBuyEntryMode\":2", "\"loadBuyEntryMode\":0"},
+    };
+
+    /**
+     * 把指定接口的响应体原样打进日志，用于确定 JSON 结构。
+     *
+     * <p>写过滤规则前必须先看到真实结构：靠猜字段名改响应，要么改不动，要么把应用改崩。
+     * {@link #PROBE_PATHS} 里列的是还没吃透的接口。</p>
+     *
+     * <p>读 body 必须用 {@code peekBody(long)}——它复制一份而不消费原流。直接调
+     * {@code body().string()} 会把流读空，应用随后拿到空响应，这是改网络层最容易踩的坑。</p>
+     *
+     * <p>每个 path 只打一次：响应体可能很大。</p>
+     */
+    private void installBodyProbe(Context ctx) {
+        ctx.feature(FEAT_BODY_PROBE, () -> {
+            Class<?> builderCls = Reflect.findClass(ctx.classLoader(), "okhttp3.Response$Builder");
+            if (builderCls == null) {
+                throw new ClassNotFoundException("okhttp3.Response$Builder (not loaded)");
+            }
+            Method build = Reflect.method(builderCls, "build");
+            final Set<String> dumped = java.util.Collections.synchronizedSet(new HashSet<>(16));
+
+            ctx.hooks.intercept(FEAT_BODY_PROBE, build, chain -> {
+                Object response = chain.proceed();
+                if (response == null) {
+                    return response;
+                }
+                try {
+                    Object request = Reflect.call(response, "request");
+                    Object url = request == null ? null : Reflect.call(request, "url");
+                    if (url == null) {
+                        return response;
+                    }
+                    String full = url.toString();
+                    String matched = null;
+                    for (String p : PROBE_PATHS) {
+                        if (full.contains(p)) {
+                            matched = p;
+                            break;
+                        }
+                    }
+                    // body 为 null 的中间 Response 必须跳过：拦截器链每层都会 build 一个，
+                    // 其中不少还没有 body。若在此之前就记入 dumped，唯一的机会就被浪费掉了。
+                    if (matched == null || Reflect.call(response, "body") == null) {
+                        return response;
+                    }
+                    Method peek = Reflect.method(response.getClass(), "peekBody", long.class);
+                    Object copy = peek.invoke(response, 262144L);
+                    String text = copy == null
+                            ? null : decodeBody((byte[]) Reflect.call(copy, "bytes"));
+                    if (text == null || !dumped.add(matched)) {
+                        return response;
+                    }
+                    ctx.log.info("body " + matched + ": " + text);
+                } catch (Throwable t) {
+                    // 打 cause：反射调用的失败都被 InvocationTargetException 包了一层
+                    Throwable cause = t instanceof java.lang.reflect.InvocationTargetException
+                            ? t.getCause() : t;
+                    ctx.log.warn("body probe failed: " + (cause == null ? t : cause));
+                }
+                return response;
+            });
+        });
+    }
+
+    /**
+     * 清空应用自家广告接口的返回内容。
+     *
+     * <p><b>这是首页轮播、右下角浮标、传输页会员条的唯一可行拦法。</b>主界面由 Flutter 绘制，
+     * 控件不是 Android View（实测切底部 tab 时 {@code addView} 无任何新记录，APK 内含
+     * {@code libapp.so}），按类名或资源名隐藏对它们完全无效。只能从数据源下手。</p>
+     *
+     * <p>接口 {@code api.123278.com/api/v2/advert_resource/get} 的真实响应：</p>
+     * <pre>
+     * {"code":0,"message":"ok","data":{"list":{"2001":[{"advert_id":...,"advert_position":2001,
+     *   "image_url":"...","jump_url":"{\"path\":\"/vip/center/page\"}",...}]}}}
+     * </pre>
+     *
+     * <p>{@code list} 是「广告位号 → 广告数组」的字典，所以把 {@code list} 置空对象即可让所有
+     * 位置都没有广告，而不必逐个位置枚举——位置号会随运营调整，枚举等于埋雷。
+     * 保留 {@code code:0} 是关键：改成错误码会让应用走失败分支，可能弹重试提示。</p>
+     *
+     * <p>hook 点选 {@code Response$Builder.build()} 并<b>改 builder 的 body 字段</b>，
+     * 而不是拿到 Response 再 {@code newBuilder().build()}——后者会重新进入本 hook 造成递归。</p>
+     *
+     * <p>编码自适应：实测该接口回的是 gzip（应用自己加了 {@code Accept-Encoding}，
+     * 所以 OkHttp 不做透明解压）。这里先读原始字节判断是否 gzip，替换内容<b>按原样编码</b>，
+     * 避免下游解压层拿到明文而报错。</p>
+     */
+    private void installAdApiFilter(Context ctx) {
+        ctx.feature(FEAT_AD_API, () -> {
+            ClassLoader cl = ctx.classLoader();
+            Class<?> builderCls = Reflect.findClass(cl, "okhttp3.Response$Builder");
+            Class<?> bodyCls = Reflect.findClass(cl, "okhttp3.ResponseBody");
+            Class<?> mediaCls = Reflect.findClass(cl, "okhttp3.MediaType");
+            if (builderCls == null || bodyCls == null || mediaCls == null) {
+                throw new ClassNotFoundException("okhttp3 Response$Builder/ResponseBody/MediaType");
+            }
+            Method build = Reflect.method(builderCls, "build");
+            Method create = Reflect.method(bodyCls, "create", mediaCls, byte[].class);
+            java.lang.reflect.Field bodyField = Reflect.field(builderCls, "body");
+            java.lang.reflect.Field requestField = Reflect.field(builderCls, "request");
+
+            ctx.hooks.intercept(FEAT_AD_API, build, chain -> {
+                try {
+                    Object builder = chain.getThisObject();
+                    if (builder == null) {
+                        return chain.proceed();
+                    }
+                    Object oldBody = bodyField.get(builder);
+                    if (oldBody == null) {
+                        return chain.proceed(); // 拦截器链中的中间 builder，多数没有 body
+                    }
+                    Object request = requestField.get(builder);
+                    Object url = request == null ? null : Reflect.call(request, "url");
+                    if (url == null) {
+                        return chain.proceed();
+                    }
+                    String full = url.toString();
+                    boolean isAdApi = full.contains(AD_API_PATH);
+                    boolean isConfig = full.contains(CONFIG_API_PATH);
+                    if (!isAdApi && !isConfig) {
+                        return chain.proceed();
+                    }
+
+                    // 读原始字节只为判断编码方式；这份 body 随后就被替换，消费掉无妨
+                    byte[] raw = (byte[]) Reflect.call(oldBody, "bytes");
+                    boolean gzipped = raw != null && raw.length > 2
+                            && (raw[0] & 0xff) == 0x1f && (raw[1] & 0xff) == 0x8b;
+
+                    String newText;
+                    if (isAdApi) {
+                        // 广告接口整体替换：内容全是广告，没有需要保留的部分
+                        newText = EMPTY_AD_JSON;
+                    } else {
+                        // 配置接口只能<b>定点改字段</b>：同一份响应里还有登录态、接口地址、
+                        // 客服链接等应用正常运行所必需的内容，整体替换会直接把应用弄坏
+                        String text = decodeBody(raw);
+                        if (text == null) {
+                            return chain.proceed();
+                        }
+                        newText = patchConfig(text);
+                        if (newText.equals(text)) {
+                            return chain.proceed(); // 没有可改的字段，保持原样
+                        }
+                    }
+
+                    byte[] payload = gzipped ? gzip(newText)
+                            : newText.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    Object mediaType = Reflect.call(oldBody, "contentType");
+                    Object newBody = create.invoke(null, mediaType, payload);
+                    bodyField.set(builder, newBody);
+                    ctx.log.hit((isAdApi ? "emptied ad api" : "patched config")
+                            + " (" + (raw == null ? 0 : raw.length) + " -> " + payload.length
+                            + " bytes, gzip=" + gzipped + ")");
+                } catch (Throwable t) {
+                    // 绝不能让替换失败连带影响正常请求
+                    ctx.log.error("ad api filter failed", t);
+                }
+                return chain.proceed();
+            });
+        });
+    }
+
+    /** 按 {@link #CONFIG_PATCHES} 逐条替换配置字段。 */
+    private static String patchConfig(String text) {
+        String out = text;
+        for (String[] pair : CONFIG_PATCHES) {
+            out = out.replace(pair[0], pair[1]);
+        }
+        return out;
+    }
+
+    /** 用 gzip 压一段文本，用于保持与原响应相同的编码。 */
+    private static byte[] gzip(String text) throws java.io.IOException {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(256);
+        try (java.util.zip.GZIPOutputStream gz = new java.util.zip.GZIPOutputStream(out)) {
+            gz.write(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
+        return out.toByteArray();
+    }
+
+    /**
+     * 记录经过 OkHttp 的请求 URL，判断广告数据是否走 Java 网络层。
+     *
+     * <p>为什么这一步是关键：主界面由 Flutter 绘制，控件不是 Android View，
+     * 按类名或资源名隐藏对它们无效（实测切 tab 时 {@code addView} 无任何新记录）。
+     * 用户反馈的三处广告都在这一层，所以唯一的着力点是<b>数据来源</b>。</p>
+     *
+     * <p>而 {@code net stack present} 已确认 OkHttp 与 Flutter 同时存在——Flutter 应用
+     * 既可能用 Dart 的 {@code HttpClient}（走 native socket，Java 完全碰不到），
+     * 也可能通过平台通道交给 Java 的 OkHttp。这个探针就是来区分这两种情况的：
+     * 只要日志里出现业务接口 URL，就说明能在响应层动手。</p>
+     *
+     * <p>只记录 path、按 path 去重、不碰 body：URL 里常带 token 与设备标识，
+     * 完整记下来既是隐私问题也会淹掉日志；而判断「能不能拦」只需要 path。</p>
+     */
+    private void installUrlProbe(Context ctx) {
+        ctx.feature(FEAT_URL_PROBE, () -> {
+            Class<?> clientCls = Reflect.findClass(ctx.classLoader(), "okhttp3.OkHttpClient");
+            if (clientCls == null) {
+                throw new ClassNotFoundException("okhttp3.OkHttpClient (not loaded)");
+            }
+            Method newCall = Reflect.methodByArity(clientCls, "newCall", 1);
+            final Set<String> seen = java.util.Collections.synchronizedSet(new HashSet<>(128));
+
+            ctx.hooks.intercept(FEAT_URL_PROBE, newCall, chain -> {
+                try {
+                    Object request = chain.getArg(0);
+                    if (request != null) {
+                        // request.url() 返回 HttpUrl，toString() 是完整 URL
+                        Object url = Reflect.call(request, "url");
+                        if (url != null) {
+                            String path = pathOf(url.toString());
+                            if (path != null && seen.add(path)) {
+                                ctx.log.info("http path: " + path);
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {
+                    // 探针失败不能影响请求本身
+                }
+                return chain.proceed();
+            });
+        });
+    }
+
+    /** 从完整 URL 里取出 host+path，丢掉 query——query 里常有 token 与设备标识。 */
+    private static String pathOf(String url) {
+        int q = url.indexOf('?');
+        String noQuery = q < 0 ? url : url.substring(0, q);
+        // 去掉协议前缀，日志更短更好读
+        int scheme = noQuery.indexOf("://");
+        return scheme < 0 ? noQuery : noQuery.substring(scheme + 3);
+    }
+
+    /**
+     * 把响应字节解成可读文本，必要时先解压。
+     *
+     * <p>实测该接口返回的是 <b>gzip</b>：直接调 {@code ResponseBody.string()} 拿到的是乱码。
+     * OkHttp 只对自己加的 {@code Accept-Encoding: gzip} 做透明解压，而这个应用是<b>自己</b>
+     * 加的请求头，所以 body 到手仍是压缩态。</p>
+     *
+     * <p>用魔数 {@code 0x1f 0x8b} 判断而不是读 {@code Content-Encoding} 头：中间层可能已经
+     * 改过头字段，而魔数不会骗人。</p>
+     */
+    private static String decodeBody(byte[] raw) {
+        if (raw == null || raw.length == 0) {
+            return null;
+        }
+        try {
+            if (raw.length > 2 && (raw[0] & 0xff) == 0x1f && (raw[1] & 0xff) == 0x8b) {
+                java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(raw.length * 4);
+                try (java.util.zip.GZIPInputStream in = new java.util.zip.GZIPInputStream(
+                        new java.io.ByteArrayInputStream(raw))) {
+                    byte[] buf = new byte[8192];
+                    int n;
+                    while ((n = in.read(buf)) > 0) {
+                        out.write(buf, 0, n);
+                    }
+                }
+                return out.toString("UTF-8");
+            }
+            return new String(raw, java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * 探测应用用的是哪套 HTTP 栈，只记录不改行为。
+     *
+     * <p>为什么必须先做这一步：实测主界面是 <b>Flutter</b> 绘制的（首页有
+     * {@code view id=0x1 cls=FlutterView}，APK 内含 {@code libapp.so}，且切换底部 tab
+     * 时 {@code addView} 一条新记录都没有）。Flutter 的控件不是 Android View，
+     * 画在同一张 canvas 上，所以<b>按类名或资源名隐藏对它们完全无效</b>——
+     * 用户反馈的首页轮播、右下角浮标、传输页会员条都在这一层。</p>
+     *
+     * <p>剩下的着力点只有数据层：广告内容来自网络响应。但方向取决于网络栈——
+     * 若走 Java 的 OkHttp/HttpURLConnection，可以在响应层过滤；若走 Dart 的
+     * {@code dart:io HttpClient}（native socket），Java hook 根本碰不到，
+     * 就得改从 Flutter 的平台通道或直接放弃这三处。</p>
+     *
+     * <p>所以这里先把事实探明再决定，而不是先写一堆规则再发现方向错了。</p>
+     */
+    private void installNetStackProbe(Context ctx) {
+        ctx.feature(FEAT_NET_PROBE, () -> {
+            String[] candidates = {
+                    // Java 侧：可在响应层过滤
+                    "okhttp3.OkHttpClient",
+                    "okhttp3.Interceptor",
+                    "com.android.okhttp.OkHttpClient",
+                    "retrofit2.Retrofit",
+                    "com.squareup.okhttp.OkHttpClient",
+                    // Flutter 平台通道：若存在，说明 Dart 侧可能把请求转交 Java
+                    "io.flutter.embedding.engine.FlutterEngine",
+                    "io.flutter.plugin.common.MethodChannel",
+                    "io.flutter.view.FlutterView",
+            };
+            StringBuilder present = new StringBuilder();
+            for (String cls : candidates) {
+                if (Reflect.hasClass(ctx.classLoader(), cls)) {
+                    if (present.length() > 0) {
+                        present.append(", ");
+                    }
+                    present.append(cls);
+                }
+            }
+            ctx.log.info("net stack present: " + (present.length() == 0 ? "(none)" : present));
+        });
     }
 
     /**

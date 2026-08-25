@@ -18,6 +18,81 @@ H sdk-init/ATSDK#start/0 -> blocked
 AdSdk, QyClient`（AdSdk = 美数 `com.meishu.sdk.core.AdSdk`）。
 其中 7 家 init 已掐断，2 家降级见下。
 
+### 主界面是 Flutter，UI 层拦不住应用自家运营位
+
+三条独立证据：APK 内含 `libapp.so`；首页有 `view id=0x1 cls=FlutterView`；
+切换底部 tab 时 `addView` **一条新记录都没有**。
+
+Flutter 控件不是 Android View，全画在同一张 canvas 上，所以按类名或资源名隐藏
+对它们完全无效。用户反馈的首页轮播、右下角浮标、传输页会员条都在这一层。
+唯一的着力点是**数据源**。
+
+### 只有 3 个请求走 Java 层 OkHttp
+
+`url-probe` 实测结果，全部在启动阶段：
+
+```
+apigate.123795.com/getconfig-api/v1/getconfig
+api.123278.com/api/app/config/get
+api.123278.com/api/v2/advert_resource/get
+```
+
+之后无论翻页、切 tab、滑动，再也不出新记录。**业务请求由 Dart 侧的
+`dart:io HttpClient` 发出，走 native socket，Java hook 完全看不到。**
+
+这条事实划定了本模块的能力边界：能拦的只有这 3 个启动期接口。
+
+### 广告接口：整体替换
+
+`api.123278.com/api/v2/advert_resource/get` 真实响应：
+
+```json
+{"code":0,"message":"ok","data":{"list":{"2001":[{"advert_id":30004,
+  "advert_position":2001,"image_url":"...","jump_url":"{\"path\":\"/vip/center/page\"}"}]}}}
+```
+
+`data.list` 是「广告位号 → 广告数组」的字典，置成 `{}` 即可让所有位置都没广告，
+不必枚举位置号（位置号随运营调整，枚举等于埋雷）。`code:0` 必须保留，
+改错误码会让应用走失败分支弹重试。
+
+### 配置接口：只能定点改字段
+
+`api.123278.com/api/app/config/get` 的 `removeAdConfig` 是运营位总开关：
+
+```json
+"isInitAd":1,
+"removeAdConfig":{"button_upload":1,"button_download":1,"button_return_file":1,
+  "button_user_center":1,"button_quit":1,"button_splash_screen":1,
+  "BuyRemoveAds":2,"remove_ads_effect":1,...}
+```
+
+这份响应同时承载 `clientIP`、`crmURL`、接口地址等应用必需内容，
+**绝不能像广告接口那样整体替换**，否则直接把应用弄坏。
+
+已验证：`button_*` 全置 0 → 传输页三屏横幅**从 3 条降到 1 条**（下载页、
+离线下载页的消失，上传页的仍在）。
+
+已验证无效：`continuousPay` / `loadVipBuyId` / `loadBuyEntryMode` / `BuyRemoveAds`
+置 0，上传页横幅与右下角「免广告」浮标依然存在 —— 它们由 Dart 侧取数绘制。
+
+不动 `remove_ads_effect`：字面是「免广告已生效」，含义未确认，
+伪造权益状态可能让应用进异常分支。只关入口。
+
+### 改 OkHttp 响应的三个坑
+
+1. **hook `Response$Builder.build()` 而不是 `RealCall.execute`** ——
+   后者包名在 OkHttp 3/4 之间不同（`okhttp3.RealCall` vs
+   `okhttp3.internal.connection.RealCall`），得做版本适配。
+2. **改 builder 的 `body` 字段，不要拿到 Response 再 `newBuilder().build()`** ——
+   后者会重新进入本 hook 造成递归。
+3. **拦截器链每层都 build 一个 Response，其中很多 `body` 为 null** ——
+   必须先判 null 再处理。第一版把「只打一次」的标记设在读取之前，
+   第一个中间响应就把唯一机会用掉了，于是只看到一次 NPE 而永远拿不到真正的响应体。
+
+另外该接口回的是 **gzip**（应用自己加了 `Accept-Encoding`，OkHttp 不做透明解压），
+所以读要先解压、写要按原编码压回去。用魔数 `1f 8b` 判断而不是读 `Content-Encoding`，
+中间层可能改过头字段。
+
 ### 诊断日志必须写文件，不能只靠 logcat
 
 **这是本项目最容易踩、代价最大的坑。** 爱加密壳初始化之后，本进程的 logcat 输出
@@ -138,6 +213,17 @@ LSPosed 管理器 2.1.1。参考模块酷安净化（`io.github.yylsping.coolapk
 - `FeatureGuard.run` 必须接受能抛受检异常的函数式接口：定位类和方法时的
   `ClassNotFoundException` / `NoSuchMethodException` 正是「该项不可用」的常规信号
 
+## 当前拦截效果
+
+| 广告位 | 状态 | 手段 |
+|---|---|---|
+| 开屏广告 | 已消除 | `frame_ad_splash_container` 置 GONE + 掐 7 家 SDK init |
+| 开屏卡顿（bid timeout） | 已消除 | 拦 `ATSDK.init/start`（5 个方法） |
+| 首页轮播广告 | 已消除 | `advert_resource/get` 的 `data.list` 置空 |
+| 传输页会员横幅 | 3 条 → 1 条 | `removeAdConfig.button_*` 置 0 |
+| 传输页上传屏横幅 | **仍在** | Dart 侧绘制，Java 层拦不到 |
+| 右下角「免广告」浮标 | **仍在** | 同上 |
+
 ## 已知降级项
 
 | 项 | 原因 |
@@ -150,17 +236,17 @@ LSPosed 管理器 2.1.1。参考模块酷安净化（`io.github.yylsping.coolapk
 
 ## 待办
 
-1. 用户反馈仍在的三处广告，需要在对应界面测绘后写规则：
-   - 首页中间左右滑动的轮播广告
-   - 右下角「免广告」浮标（截图确认仍在，位置 1213,2402）
-   - 传输页 3 条「开通会员」
-   这三处是**应用自家运营位**，不是第三方 SDK，必须靠资源名。
-   当前测绘只覆盖了启动路径，需要手动进那几个页面再抓一次。
-2. 首页有 `FlutterView`（`view id=0x1 cls=FlutterView`）——首页轮播若在 Flutter
-   里绘制，`addView` 抓不到，需要另找路子。**这条会决定第 1 项能不能做成。**
-3. 修 `WindAds` / `QyClient` 的方法名
+1. **剩余两处（上传屏横幅、右下角浮标）已确认在 Java 层拦不到。** 可行方向：
+   - 拦 Flutter 平台通道 `MethodChannel`（`io.flutter.plugin.common.MethodChannel`
+     已确认存在），看 Dart 侧是否通过它取配置
+   - 若纯 Dart 自取，则只能改 `libapp.so` 或放弃这两处
+
+   **不要再往 `CONFIG_PATCHES` 里加字段试**——已试过
+   `continuousPay` / `loadVipBuyId` / `loadBuyEntryMode` / `BuyRemoveAds`，全部无效。
+2. 修 `WindAds` / `QyClient` 的方法名（真机反射打出实际方法列表）
+3. 发布前把 `net-probe` / `url-probe` / `body-probe` / `survey` 收进 verbose 开关，
+   或直接移除；`FileLog` 也应受 verbose 控制，别无条件写 `/sdcard`
 4. 把 `ServiceBridge.scope()` 显示到 `MainActivity`
-5. 提交代码（仓库目前只有初始 commit）
 
 ## 真机验证流程
 
