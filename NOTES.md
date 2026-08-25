@@ -405,6 +405,38 @@ Java 能碰到的任何配置。
 **不要再往 `CONFIG_PATCHES` / `AD_OFF_KEYS` / prefs 补丁里加字段试。**
 已排除方向表就是为了防止重走这些路。
 
+## 已启用的功能（12 项）
+
+探针在定位完成后已全部移除，只留真正改变行为的规则：
+
+| feature id | 作用 |
+|---|---|
+| `ad-activity` | 拦广告 Activity 启动（开屏、激励视频、落地页） |
+| `ad-view` | 广告 View 加入布局时置 GONE（按 SDK 类名前缀） |
+| `ad-view-id` | 按资源名隐藏容器（Sigmob 的 `wm_*` 那套混淆弹窗） |
+| `anythink-bridge` | **改 `MethodCall.method` 掐掉 Dart 侧广告加载** |
+| `own-ad-cache` | 清 prefs 里的自家广告缓存 + 开关置 0 + 断曝光上报 |
+| `ad-api` | 清空 `advert_resource/get` 的 `data.list`、点改 `config/get` |
+| `sdk-init/*` | 7 家 SDK 的 init 方法级掐断 |
+
+## 已移除的探针（不要重新加回来）
+
+| 曾经的 feature | 用途 | 为什么移除 |
+|---|---|---|
+| `probe` | 列出实际加载的 SDK | 名单已固化进 `SDK_INIT_ENTRIES` |
+| `net-probe` | 判断 HTTP 栈 | 结论已确定：OkHttp + Flutter 并存 |
+| `url-probe` | 找广告接口 | 3 个接口已找到并写进规则 |
+| `body-probe` | 看响应 JSON 结构 | 结构已吃透，`CONFIG_PATCHES` 就是产物 |
+| `flutter-probe` | 通道测绘 | ~40 条通道已测完，`anythink_sdk` 已定点拦 |
+| `survey` | 打控件资源名 | `AD_CONTAINER_IDS` 就是产物 |
+| `native-bridge` | 改桥参数里的开关 | 实测对两处 Flutter 广告位无效 |
+| `fake-vip` | 伪造 `isVip=1` | 实测无效，且是唯一伪造状态的规则，无收益不留 |
+
+移除它们的收益不只是代码量：`flutter-probe` 挂在 `DartMessenger` 上，
+每条通道消息都要过一次拦截器；`native-bridge` 与 `fake-vip` 挂在
+`MethodCall` 构造与 `SharedPreferences` 读取这两条高频路径上。
+去掉后 hook 点从 20 项降到 12 项，日志从数百行降到 130 行。
+
 ## 已知降级项
 
 | 项 | 原因 |
@@ -418,13 +450,8 @@ Java 能碰到的任何配置。
 ## 待办
 
 1. 修 `WindAds` / `QyClient` 的方法名（真机反射打出实际方法列表）
-2. 发布前把 `net-probe` / `url-probe` / `body-probe` / `flutter-probe` / `survey`
-   收进 verbose 开关，或直接移除；`FileLog` 也应受 verbose 控制，
-   别无条件写 `/sdcard`
-3. 把 `fake-vip` 在模块界面做成可单独关闭的开关（代码已支持
-   `isFeatureEnabled`，缺 UI）。它是唯一伪造应用状态的规则，
-   应当让用户自己决定要不要开
-4. 把 `ServiceBridge.scope()` 显示到 `MainActivity`
+2. `FileLog` 收进 verbose 开关，别无条件写 `/sdcard`
+3. 把 `ServiceBridge.scope()` 显示到 `MainActivity`
 
 ## 真机验证流程
 

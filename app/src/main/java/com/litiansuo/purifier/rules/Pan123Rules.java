@@ -40,62 +40,26 @@ final class Pan123Rules implements RuleSet {
     private static final String FEAT_AD_ACTIVITY = "ad-activity";
     /** 广告 View 加入布局时隐藏（信息流内嵌广告、banner）。 */
     private static final String FEAT_AD_VIEW = "ad-view";
-    /** 广告 SDK 探测：确认到底哪几家真的被加载。 */
-    private static final String FEAT_PROBE = "probe";
     /** 广告 SDK 初始化拦截（从源头掐断，广告请求不会发出）。 */
     private static final String FEAT_SDK_INIT = "sdk-init";
-    /**
-     * 界面测绘：把控件资源名打进日志，用于定位应用自家运营位。
-     *
-     * <p>默认开启，规则写全后可在模块里单独关掉。它只记日志、不改行为。</p>
-     */
-    private static final String FEAT_SURVEY = "survey";
     /** 按资源名隐藏广告位：应对类名混淆但资源名明文的情况。 */
     private static final String FEAT_AD_VIEW_ID = "ad-view-id";
-    /** 网络栈探测：判定广告数据能否在 Java 层拦下。 */
-    private static final String FEAT_NET_PROBE = "net-probe";
-    /** 请求 URL 探测：找出广告内容对应的接口。 */
-    private static final String FEAT_URL_PROBE = "url-probe";
     /** 广告接口拦截：清空应用自家运营位的返回内容。 */
     private static final String FEAT_AD_API = "ad-api";
-    /** 响应体结构探测：写过滤规则前必须先看到真实 JSON。 */
-    private static final String FEAT_BODY_PROBE = "body-probe";
-    /** Flutter 平台通道测绘：找出 Dart 侧广告位的数据来源。 */
-    private static final String FEAT_FLUTTER = "flutter-probe";
-    /** 原生桥过滤：在应用自家 Flutter 桥上改掉去广告开关。 */
-    private static final String FEAT_BRIDGE = "native-bridge";
     /** AnyThink Flutter 桥拦截：掐掉 Dart 侧发起的广告加载请求。 */
     private static final String FEAT_AT_BRIDGE = "anythink-bridge";
-    /** 自家广告缓存清理：清掉 Dart 侧存在 prefs 里的运营位内容。 */
+    /** 自家广告缓存清理：清掉 Dart 侧存在 prefs 里的运营位内容与开关。 */
     private static final String FEAT_OWN_AD = "own-ad-cache";
-    /**
-     * 本地会员标记伪造：让 Dart 侧以为已开通会员，从而不展示「非会员才显示」的推广位。
-     *
-     * <p><b>本模块唯一伪造状态的功能，故单独成项</b>，用户可在模块界面单独关掉。
-     * 其余规则都只是「不显示广告」，这一项改变了应用对自身状态的认知。</p>
-     */
-    private static final String FEAT_VIP = "fake-vip";
-
-    /** 本地会员标记的键名，写入与读取两侧共用。 */
-    private static final String VIP_KEY = "isVip";
 
     /**
-     * 桥调用参数里代表「显示广告/会员入口」的键名，一律改成关闭。
+     * Flutter prefs 里代表「显示广告/会员入口」的开关键名，一律置 0。
      *
-     * <p>来自实测的 {@code storageAdFreeData} 与 {@code appAdConfig} 调用：</p>
-     * <pre>
-     * storageAdFreeData: button_splash_screen, button_upload, button_download,
-     *                    button_quit, button_user_center, button_return_file,
-     *                    remove_ads_effect, removeAdsTime
-     * appAdConfig:       isPreloadSplash, isPreloadInter, isOpenSplash,
-     *                    splashInterval, allInterval
-     * </pre>
+     * <p>这批键在 HTTP 响应（{@code removeAdConfig}）与 Flutter prefs 里<b>各有一份</b>，
+     * 而 Dart 读的是自己缓存的那一份。HTTP 侧置 0 已实测使传输页横幅由 3 条降到 1 条，
+     * 语义确认无误，所以缓存侧同样置 0。</p>
      *
-     * <p>按键名匹配而不是按方法名：同一批开关会出现在多个调用里，
-     * 盯键名一次覆盖全部，也不会因为应用改版换方法名而失效。</p>
-     *
-     * <p>{@code removeAdsTime} / {@code splashInterval} / {@code allInterval} 不在此列：
-     * 它们是时长而非开关，置 0 可能被理解成「间隔 0 秒」而变成无限加载。</p>
+     * <p>只收开关，不收时长：{@code removeAdsTime} 之类置 0 等于「权益已过期」，
+     * 是反效果，另见 {@link #AD_TIME_KEYS}。</p>
      */
     private static final Set<String> AD_OFF_KEYS = new HashSet<>(java.util.Arrays.asList(
             "button_splash_screen",
@@ -103,81 +67,8 @@ final class Pan123Rules implements RuleSet {
             "button_download",
             "button_quit",
             "button_user_center",
-            "button_return_file",
-            "isPreloadSplash",
-            "isPreloadInter",
-            "isOpenSplash"
+            "button_return_file"
     ));
-
-    /**
-     * 需要强制<b>开启</b>的键：免广告功能开关。
-     *
-     * <p>与 {@link #AD_OFF_KEYS} 相反。它与 {@link #AD_TIME_KEYS} 成对使用——
-     * 开关为真、时长顶满，才表示「免广告权益正在生效」。
-     * 把开关置 0 会让时长根本不被检查。</p>
-     *
-     * <p>两种写法都列上：HTTP 与桥用下划线，Flutter prefs 用小驼峰。</p>
-     */
-    private static final Set<String> AD_ON_KEYS = new HashSet<>(java.util.Arrays.asList(
-    ));
-
-    /**
-     * {@code removeAdsEffect} 判别实验结论：置 0 对浮标无效，故不再改它。
-     *
-     * <p>浮标写着「免广告」，点开是「连续看 3 个广告可获得 24 小时免广告权益」，
-     * 看起来浮标就是这个功能的入口。但 prefs 层把 {@code removeAdsEffect} 置 0 后
-     * （日志确认 {@code prefs ad switches off: 1 key(s)}）浮标依旧存在，
-     * 说明它只控制权益是否生效，不控制入口是否展示。</p>
-     *
-     * <p>保留空集合而非删掉这段：记录已排除的方向，避免以后重试。</p>
-     */
-    private static final Set<String> AD_EFFECT_KEYS = java.util.Collections.emptySet();
-
-    /**
-     * 需要逐条记录 payload 的通道。
-     *
-     * <p>{@code com.wisdom.water.main} 是应用自家的原生桥，实测形如
-     * {@code pluginPool + methodName=getAppChannel}——单通道 + 方法名分发。
-     * 这种通道按名字去重只会留下第一条，必须逐条看才能找出取广告配置的那次调用。</p>
-     *
-     * <p>{@code anythink_sdk} 是 AnyThink 聚合广告的 Dart 桥，广告请求就从这里发起。</p>
-     */
-    private static final Set<String> DETAIL_CHANNELS = new HashSet<>(java.util.Arrays.asList(
-            "com.wisdom.water.main",
-            "anythink_sdk",
-            // Flutter 官方 shared_preferences 的 pigeon 通道。浮标有「关闭」按钮，
-            // 说明关闭状态一定被持久化在某处；原生 prefs 只有 lastVersionCodeUsed，
-            // 所以状态大概率写在 Dart 侧这条通道上。
-            "dev.flutter.pigeon.SharedPreferencesApi.setBool",
-            "dev.flutter.pigeon.SharedPreferencesApi.setString",
-            "dev.flutter.pigeon.SharedPreferencesApi.setInt",
-            "dev.flutter.pigeon.SharedPreferencesApi.getAll",
-            "dev.flutter.pigeon.SharedPreferencesApi.getKeys",
-            "dev.flutter.pigeon.SharedPreferencesAsyncApi.setBool",
-            "dev.flutter.pigeon.SharedPreferencesAsyncApi.setString",
-            "dev.flutter.pigeon.SharedPreferencesAsyncApi.setInt",
-            "dev.flutter.pigeon.SharedPreferencesAsyncApi.getAll",
-            "dev.flutter.pigeon.SharedPreferencesAsyncApi.getKeys"
-    ));
-
-    /**
-     * 需要打印响应体的接口。
-     *
-     * <p><b>重要发现：整个应用只有 3 个请求走 Java 层 OkHttp</b>——
-     * {@code /getconfig-api/v1/getconfig}、{@code /app/config/get}、
-     * {@code /advert_resource/get}，都在启动阶段。之后无论怎么翻页、切 tab，
-     * {@code url-probe} 再也不出新记录。</p>
-     *
-     * <p>这说明业务请求由 Dart 侧的 {@code dart:io HttpClient} 发出，走 native socket，
-     * <b>Java hook 完全看不到</b>。所以能拦的就只有这 3 个启动期接口；
-     * 传输页横幅与右下角浮标那类 Flutter 自绘、Dart 取数的内容不在射程内。</p>
-     *
-     * <p>保留配置接口是为了随时核对补丁是否真的写进去了。</p>
-     */
-    private static final String[] PROBE_PATHS = {
-            // 不能写成 CONFIG_API_PATH：它声明在本字段之后，属于非法前向引用
-            "/app/config/get",
-    };
 
     /**
      * 替换后的广告接口响应。
@@ -209,7 +100,8 @@ final class Pan123Rules implements RuleSet {
     /**
      * 广告容器的资源名。命中即整块隐藏。
      *
-     * <p>这批名字来自真机测绘（{@link ViewSurvey}），不是猜的。资源名不参与混淆，
+     * <p>这批名字来自真机测绘（曾有一个 {@code survey} 功能把每个 {@code addView}
+     * 的资源名打进日志，名单固化后已移除）。资源名不参与混淆，
      * 是加固应用里唯一稳定的界面锚点。</p>
      *
      * <p>只收<b>容器</b>不收叶子控件：隐藏 {@code frame_ad_splash_container} 比逐个隐藏
@@ -367,13 +259,7 @@ final class Pan123Rules implements RuleSet {
 
             // 类 -> 是否广告 View。用类对象做键，避免每次都做字符串前缀匹配。
             final Map<Class<?>, Boolean> cache = new ConcurrentHashMap<>();
-            // 测绘：应用自家运营位无法用类名前缀识别，只能靠资源名，先把真实资源名收集出来
-            final ViewSurvey survey = ctx.config.isFeatureEnabled(FEAT_SURVEY)
-                    ? new ViewSurvey(ctx.log) : null;
-            if (survey == null) {
-                ctx.guard.markDisabled(FEAT_SURVEY);
-            }
-            // 按资源名隐藏：混淆过的 SDK 弹窗与应用自家运营位只能靠这条路
+            // 按资源名隐藏：混淆过的 SDK 弹窗（Sigmob 的 wm_* 那套）只能靠这条路
             final boolean hideById = ctx.config.isFeatureEnabled(FEAT_AD_VIEW_ID);
             if (!hideById) {
                 ctx.guard.markDisabled(FEAT_AD_VIEW_ID);
@@ -392,11 +278,8 @@ final class Pan123Rules implements RuleSet {
                     if (isAd) {
                         v.setVisibility(View.GONE);
                         ctx.log.hit("hid ad view: " + c.getName());
-                    } else if (hideById && hideByResourceId(ctx, v)) {
-                        // 已按资源名处理，不再测绘
-                    } else if (survey != null) {
-                        // 只对非广告 View 测绘：广告 View 已经处理掉了，不需要再记
-                        survey.record(v, 0);
+                    } else if (hideById) {
+                        hideByResourceId(ctx, v);
                     }
                 }
                 return chain.proceed();
@@ -440,17 +323,13 @@ final class Pan123Rules implements RuleSet {
      * {@inheritDoc}
      *
      * <p>此时壳已解密并加载真实 dex，广告 SDK 的类可以定位了。</p>
+     *
+     * <p>顺序有意为之：先掐 Dart 侧的加载请求（{@code anythink-bridge}），
+     * 再清缓存与改接口响应。反过来的话第一批广告已经在路上了。</p>
      */
     @Override
     public void installLate(Context ctx) {
-        installProbe(ctx);
-        installNetStackProbe(ctx);
-        installUrlProbe(ctx);
-        installBodyProbe(ctx);
-        installFlutterChannelProbe(ctx);
-        installNativeBridgeFilter(ctx);
         installAnyThinkBridgeBlock(ctx);
-        installVipFlagOverride(ctx);
         installOwnAdCacheFilter(ctx);
         installAdApiFilter(ctx);
         installSdkInitBlock(ctx);
@@ -596,19 +475,6 @@ final class Pan123Rules implements RuleSet {
                     e.setValue(now);
                     changed++;
                 }
-            } else if (AD_EFFECT_KEYS.contains(name)) {
-                // 判别实验：置 0 看浮标（免广告入口）是否消失
-                Object now = asSameType(v, 0L);
-                if (now != null && !now.equals(v)) {
-                    e.setValue(now);
-                    changed++;
-                }
-            } else if (AD_ON_KEYS.contains(name)) {
-                Object now = asSameType(v, 1L);
-                if (now != null && !now.equals(v)) {
-                    e.setValue(now);
-                    changed++;
-                }
             } else if (AD_OFF_KEYS.contains(name)) {
                 Object now = asSameType(v, 0L);
                 if (now != null && !now.equals(v)) {
@@ -646,39 +512,6 @@ final class Pan123Rules implements RuleSet {
 
     /** Flutter {@code shared_preferences} 给每个键加的前缀。 */
     private static final String FLUTTER_PREFIX = "flutter.";
-
-    /**
-     * 打印几个与浮标有关的 prefs 值，用于判断浮标数据究竟藏在哪。
-     *
-     * <p>{@code interface_config} 是最可疑的：名字就是「界面配置」，
-     * 而浮标是个跨页面常驻的界面元素。{@code ownAdInfo} 打印内容确认清空是否真的生效，
-     * {@code ac_*} 与 {@code lastOwnAd*} 用于对照位置号。</p>
-     *
-     * <p>只在值变化时打印，避免高频读取刷爆日志。</p>
-     */
-    private static void dumpInterestingValues(Context ctx, Map<String, Object> map) {
-        for (Map.Entry<String, Object> e : map.entrySet()) {
-            String key = e.getKey();
-            if (!isProbeValueKey(key)) {
-                continue;
-            }
-            Object v = e.getValue();
-            String text = String.valueOf(v);
-            // 长值分片打印而不是截断：interface_config 里是 Dart 侧的全部接口 URL，
-            // 取广告那条可能在任何位置，截断就看不见了。
-            for (int i = 0; i < text.length() && i < 12000; i += 700) {
-                String part = text.substring(i, Math.min(text.length(), i + 700));
-                String line = key + "[" + i + "] = " + part;
-                if (VALUE_SEEN.size() < 80 && VALUE_SEEN.add(line)) {
-                    ctx.log.info("prefs value " + line);
-                }
-            }
-        }
-    }
-
-    /** 已打印过的 prefs 值，避免重复。 */
-    private static final Set<String> VALUE_SEEN =
-            java.util.Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
 
     /**
      * 把 Dart 侧取广告的接口地址改成无效地址。
@@ -774,61 +607,6 @@ final class Pan123Rules implements RuleSet {
     private static final String DEAD_URL = "http:\\/\\/127.0.0.1:1\\/blocked";
 
     /**
-     * 把 {@code flutter.TrackingInfo} 里的会员标记改成已开通。
-     *
-     * <p>实测原值：{@code {"loginStatus":"1","vipType":"0","vipSub":"0",
-     * "developSub":"0","packType":"0"}}。</p>
-     *
-     * <p><b>这是比 {@code isVip} 更可信的会员状态来源</b>：{@code isVip} 存在应用自家的
-     * prefs 里、由原生桥读写，而这份 {@code TrackingInfo} 由 Dart 侧
-     * 直接经 {@code SharedPreferencesApi.setString} 写入——也就是说
-     * <b>Dart 自己认这一份</b>。浮标是「非会员才展示」的推广位，
-     * 之前改 {@code isVip} 无效，很可能就是改错了地方。</p>
-     *
-     * <p>只改 {@code vipType}，不动 {@code vipSub} / {@code developSub} / {@code packType}：
-     * 那几个是订阅方式与套餐类型，含义未确认，乱改可能落进未预料的分支。</p>
-     *
-     * @return 改动数（0 或 1）
-     */
-    /**
-     * 判别实验（已完成，结论：无效，故不再调用）：把 {@code flutter.TrackingInfo} 的
-     * {@code vipType} 改成 1。
-     *
-     * <p>原值 {@code {"loginStatus":"1","vipType":"0",...}}，由 Dart 侧直接经
-     * {@code SharedPreferencesApi.setString} 写入，看起来比原生桥的 {@code isVip}
-     * 更可信。实测改成 1（日志确认 {@code TrackingInfo vipType -> 1}）后浮标仍在。</p>
-     *
-     * <p>结论：{@code TrackingInfo} 只是埋点上报用的快照（名字就是 Tracking），
-     * 不参与界面判断。会员状态的真实来源在 Dart 内存里，由那些 Java 看不见的
-     * 业务请求直接填充。</p>
-     *
-     * <p>保留代码而非删除：这是个语义明确、成本很低的探针，
-     * 若以后应用改版把 {@code TrackingInfo} 变成真状态源，直接接回调用即可。</p>
-     */
-    private static int patchTrackingInfoDisabled(Context ctx, Map<String, Object> map) {
-        Object raw = map.get("flutter.TrackingInfo");
-        if (!(raw instanceof String)) {
-            return 0;
-        }
-        String json = (String) raw;
-        String patched = json.replace("\"vipType\":\"0\"", "\"vipType\":\"1\"");
-        if (patched.equals(json)) {
-            return 0;
-        }
-        map.put("flutter.TrackingInfo", patched);
-        return 1;
-    }
-
-    /** 判断是否是需要打印内容的探测键。 */
-    private static boolean isProbeValueKey(String key) {
-        return key.equals("flutter.interface_config")
-                || key.startsWith("flutter.ownAdInfo")
-                || key.startsWith("flutter.ac_")
-                || key.startsWith("flutter.lastOwnAd")
-                || key.startsWith("flutter.lastShowAdType");
-    }
-
-    /**
      * 掐掉 Dart 侧发起的 AnyThink 广告请求。
      *
      * <p><b>这是弹窗、原生广告、横幅的真正来源。</b>通道测绘抓到 Dart 侧持续调用：</p>
@@ -906,335 +684,6 @@ final class Pan123Rules implements RuleSet {
     }
 
     /**
-     * 在读取侧覆盖本地会员标记。
-     *
-     * <p>为什么必须改读取侧：{@link #patchKeyValueLists} 已把写入的 {@code isVip} 改成 1
-     * （日志确认 {@code bridge isVip 0 -> 1}），但横幅依旧存在。原因是 Dart 侧通过
-     * {@code obtainSharedPreferences} <b>取</b>值，而回复方向的数据是按下标定位的数组，
-     * 没有键名可匹配，在通道层改不了。</p>
-     *
-     * <p>绕过通道，直接改数据的真正来源：桥最终读的是 Android {@code SharedPreferences}。
-     * 在 {@code SharedPreferencesImpl} 上拦一层，无论谁问 {@code isVip}、
-     * 走哪条路径，答案都一致。这也顺带覆盖了原生侧自己读这个值的地方。</p>
-     *
-     * <p>类型必须原样返回：桥存的是字符串，Dart 也按字符串解，返回数字会解码失败。
-     * 所以三个 getter 各自返回对应类型。</p>
-     *
-     * <p>热点考虑：{@code SharedPreferences} 读取很频繁，所以回调里<b>第一步就是键名比较</b>，
-     * 不匹配立刻 {@code proceed()}，不做任何额外工作。</p>
-     */
-    private void installVipFlagOverride(Context ctx) {
-        ctx.feature(FEAT_VIP, () -> {
-            Class<?> prefsCls = Reflect.findClass(ctx.classLoader(),
-                    "android.app.SharedPreferencesImpl");
-            if (prefsCls == null) {
-                throw new ClassNotFoundException("android.app.SharedPreferencesImpl");
-            }
-            Method getString = Reflect.method(prefsCls, "getString", String.class, String.class);
-            Method getInt = Reflect.method(prefsCls, "getInt", String.class, int.class);
-            Method getBoolean = Reflect.method(prefsCls, "getBoolean", String.class, boolean.class);
-            Method getAll = Reflect.method(prefsCls, "getAll");
-
-            // 键名测绘：Dart 侧的 shared_preferences 也落在这里（键名带 flutter. 前缀），
-            // 浮标之类「可手动关闭」的组件必然存了关闭状态，先看清有哪些键才能定点覆盖。
-            //
-            // 必须逐个 prefs 文件都 dump：应用会打开多个 prefs 文件
-            // （自家的、Flutter 的 FlutterSharedPreferences、各 SDK 的），
-            // 只记第一个非空的会漏掉真正想找的那个——上一轮就是这么漏的。
-            final Set<String> dumped = java.util.Collections.newSetFromMap(
-                    new ConcurrentHashMap<String, Boolean>());
-            ctx.hooks.intercept(FEAT_VIP + "-keys", getAll, chain -> {
-                Object all = chain.proceed();
-                if (!(all instanceof Map) || ((Map<?, ?>) all).isEmpty()) {
-                    return all;
-                }
-                StringBuilder sb = new StringBuilder();
-                for (Object k : ((Map<?, ?>) all).keySet()) {
-                    if (sb.length() > 0) {
-                        sb.append(" | ");
-                    }
-                    sb.append(k);
-                }
-                String keys = sb.toString();
-                // 按键集合去重而非按次数：同一文件被反复读取，但键集合变化时要能看到
-                if (dumped.size() < 40 && dumped.add(keys)) {
-                    ctx.log.info("prefs keys: " + keys);
-                }
-                return all;
-            });
-
-            ctx.hooks.intercept(FEAT_VIP, getString, chain -> {
-                if (!VIP_KEY.equals(chain.getArg(0))) {
-                    return chain.proceed();
-                }
-                ctx.log.hit("prefs isVip -> \"1\"");
-                return "1";
-            });
-            ctx.hooks.intercept(FEAT_VIP, getInt, chain -> {
-                if (!VIP_KEY.equals(chain.getArg(0))) {
-                    return chain.proceed();
-                }
-                ctx.log.hit("prefs isVip -> 1");
-                return 1;
-            });
-            ctx.hooks.intercept(FEAT_VIP, getBoolean, chain -> {
-                if (!VIP_KEY.equals(chain.getArg(0))) {
-                    return chain.proceed();
-                }
-                ctx.log.hit("prefs isVip -> true");
-                return Boolean.TRUE;
-            });
-        });
-    }
-
-    /**
-     * 在应用自家的 Flutter 原生桥上改掉去广告配置。
-     *
-     * <p>为什么这是剩余两处广告的正确着力点：通道测绘显示 Dart 侧通过
-     * {@code com.wisdom.water.main} 调用 {@code storageAdFreeData} 把
-     * {@code button_upload} / {@code button_user_center} / {@code remove_ads_effect}
-     * 等字段<b>存进原生侧</b>，随后再用 {@code obtainSharedPreferences} 取回来判断显示。</p>
-     *
-     * <p>这意味着改 HTTP 响应不够：Dart 侧可能有自己的缓存或默认值，
-     * 而这里是「配置真正落地」的地方。把存进去的值全部改成 0，
-     * 无论 Dart 从哪儿拿到原始配置，最终读到的都是关闭状态。</p>
-     *
-     * <p>hook 点选 {@code MethodCall} 的<b>构造函数</b>。原先想拦
-     * {@code MethodChannel$MethodCallHandler.onMethodCall}，但那是接口里的抽象方法，
-     * 框架直接拒绝：{@code Cannot hook abstract methods}。抽象方法没有实体可替换，
-     * 要拦只能找到每个实现类——而实现类在应用侧且被混淆，不可行。</p>
-     *
-     * <p>{@code MethodCall} 由编解码器在解出完整参数后构造，是所有通道方法的必经之路，
-     * 且它就在 Flutter 框架里、类名稳定。{@code arguments} 字段是 final，
-     * 但解码出来的 Map 本身可变，<b>就地改内容</b>即可，不必碰字段。</p>
-     *
-     * <p><b>只改值不拦调用</b>：Dart 侧在 await 这些调用的回复，
-     * 直接不放行会让它永远等下去，界面就卡住了。</p>
-     */
-    private void installNativeBridgeFilter(Context ctx) {
-        ctx.feature(FEAT_BRIDGE, () -> {
-            Class<?> callCls = Reflect.findClass(ctx.classLoader(),
-                    "io.flutter.plugin.common.MethodCall");
-            if (callCls == null) {
-                throw new ClassNotFoundException("io.flutter.plugin.common.MethodCall");
-            }
-            java.lang.reflect.Constructor<?> ctor =
-                    Reflect.ctor(callCls, String.class, Object.class);
-
-            ctx.hooks.interceptCtor(FEAT_BRIDGE, ctor, chain -> {
-                try {
-                    Object args = chain.getArg(1);
-                    if (args instanceof Map) {
-                        patchBridgeArgs(ctx, (Map<?, ?>) args);
-                    }
-                } catch (Throwable t) {
-                    ctx.log.error("native bridge filter failed", t);
-                }
-                return chain.proceed();
-            });
-        });
-    }
-
-    /**
-     * 把桥调用参数里的广告开关全部改成关闭。
-     *
-     * <p>按<b>键名</b>匹配而不是按方法名：同一批开关会出现在
-     * {@code storageAdFreeData}、{@code appAdConfig} 等多个调用里，
-     * 盯键名一次覆盖全部，也不会因为应用改版换方法名而失效。</p>
-     */
-    @SuppressWarnings("unchecked")
-    private static void patchBridgeArgs(Context ctx, Map<?, ?> args) {
-        Map<Object, Object> m = (Map<Object, Object>) args;
-        int changed = 0;
-        for (Map.Entry<Object, Object> e : m.entrySet()) {
-            if (!(e.getKey() instanceof String)) {
-                continue;
-            }
-            String k = (String) e.getKey();
-            Object v = e.getValue();
-            if (AD_TIME_KEYS.contains(k)) {
-                // 时长类：顶满而非置 0。置 0 等于权益已过期，是反效果。
-                if (v instanceof Integer) {
-                    e.setValue((int) AD_FREE_TIME);
-                    changed++;
-                } else if (v instanceof Long) {
-                    e.setValue(AD_FREE_TIME);
-                    changed++;
-                } else if (v instanceof String) {
-                    e.setValue(String.valueOf(AD_FREE_TIME));
-                    changed++;
-                }
-                continue;
-            }
-            if (AD_OFF_KEYS.contains(k)) {
-                // 类型必须与原值一致：Dart 侧按声明类型解码，int 换成 bool 会直接抛异常
-                if (v instanceof Boolean && (Boolean) v) {
-                    e.setValue(Boolean.FALSE);
-                    changed++;
-                } else if (v instanceof Integer && (Integer) v != 0) {
-                    e.setValue(0);
-                    changed++;
-                }
-            }
-        }
-        if (changed > 0) {
-            ctx.log.hit("bridge args patched: " + changed + " key(s)");
-        }
-        patchKeyValueLists(ctx, m);
-    }
-
-    /**
-     * 处理 {@code keyList} / {@code valueList} 双数组形式的共享参数写入。
-     *
-     * <p>实测 {@code storageSharedPreferences} 的参数长这样：</p>
-     * <pre>
-     * {"keyList":["isVip","isAgreeAgreement"], "valueList":["0","1"]}
-     * </pre>
-     *
-     * <p>键与值分在两个数组里按下标对应，所以不能靠 {@link #AD_OFF_KEYS} 那种按键名
-     * 直接取值的方式处理，得先在 keyList 里定位下标。</p>
-     *
-     * <p><b>为什么要改 {@code isVip}</b>：传输页上传屏的「VIP 连续包月 ¥6.00」横幅与
-     * 右下角「免广告」浮标，在广告接口清空、配置开关全关、桥参数全改之后依然存在。
-     * 通道测绘显示 Dart 侧唯一还会读的相关状态就是 {@code isVip}，那两处必然是
-     * 「非会员才展示的推广位」。</p>
-     *
-     * <p><b>这是本模块唯一伪造状态的地方，必须单独成一项</b>（{@link #FEAT_VIP}），
-     * 用户可在模块界面单独关掉。副作用是本地会以为已开通会员，
-     * 服务端仍按真实状态返回，涉及配额的操作该失败还是会失败。</p>
-     */
-    private static void patchKeyValueLists(Context ctx, Map<Object, Object> m) {
-        if (!ctx.config.isFeatureEnabled(FEAT_VIP)) {
-            return;
-        }
-        Object keys = m.get("keyList");
-        Object values = m.get("valueList");
-        if (!(keys instanceof java.util.List) || !(values instanceof java.util.List)) {
-            return;
-        }
-        java.util.List<?> kl = (java.util.List<?>) keys;
-        @SuppressWarnings("unchecked")
-        java.util.List<Object> vl = (java.util.List<Object>) values;
-        for (int i = 0; i < kl.size() && i < vl.size(); i++) {
-            if (!"isVip".equals(kl.get(i))) {
-                continue;
-            }
-            Object old = vl.get(i);
-            // 保持原类型：Dart 按声明类型解码，字符串换成数字会直接抛异常
-            Object now = old instanceof Boolean ? Boolean.TRUE
-                    : old instanceof Integer ? (Object) 1 : "1";
-            if (!now.equals(old)) {
-                vl.set(i, now);
-                ctx.log.hit("bridge isVip " + old + " -> " + now);
-            }
-        }
-    }
-
-    /**
-     * 测绘 Flutter 平台通道，找出剩余广告位的数据来源。
-     *
-     * <p>为什么走这条路：传输页上传屏横幅与右下角「免广告」浮标是 Flutter 绘制的，
-     * 既没有 Android View 可隐藏，也不经过 Java 层 OkHttp（全应用只有 3 个启动期请求走
-     * OkHttp）。但 Flutter 与原生之间的<b>所有</b>通信都必须经过平台通道，
-     * 而通道实现在 Java 侧——这是 Dart 世界唯一对 Java hook 敞开的入口。</p>
-     *
-     * <p>{@code DartMessenger} 是通道的唯一收敛点：{@code handleMessageFromDart} 是
-     * Dart→Java，{@code send} 是 Java→Dart。只要配置或广告数据是通过原生侧取的，
-     * 就一定出现在这里。</p>
-     *
-     * <p>{@code send} 的重载不止一个，用 {@link Reflect#methodsNamed} 全挂，
-     * 避免猜错签名而漏掉真正在用的那个。</p>
-     *
-     * <p>成本控制：按「方向 + 通道名」去重，每个通道只记一次；
-     * payload 另设总量上限，避免通道高频往返时把日志刷爆。</p>
-     */
-    private void installFlutterChannelProbe(Context ctx) {
-        ctx.feature(FEAT_FLUTTER, () -> {
-            Class<?> messengerCls = Reflect.findClass(ctx.classLoader(),
-                    "io.flutter.embedding.engine.dart.DartMessenger");
-            if (messengerCls == null) {
-                throw new ClassNotFoundException("io.flutter.embedding.engine.dart.DartMessenger");
-            }
-            final Set<String> seen = java.util.Collections.synchronizedSet(new HashSet<>(64));
-            final java.util.concurrent.atomic.AtomicInteger dumps =
-                    new java.util.concurrent.atomic.AtomicInteger();
-
-            int hooked = 0;
-            for (Method m : Reflect.methodsNamed(messengerCls, "handleMessageFromDart")) {
-                ctx.hooks.intercept(FEAT_FLUTTER, m, chain -> {
-                    recordChannel(ctx, seen, dumps, "dart->java",
-                            chain.getArg(0), chain.getArg(1));
-                    return chain.proceed();
-                });
-                hooked++;
-            }
-            for (Method m : Reflect.methodsNamed(messengerCls, "send")) {
-                ctx.hooks.intercept(FEAT_FLUTTER, m, chain -> {
-                    recordChannel(ctx, seen, dumps, "java->dart",
-                            chain.getArg(0), chain.getArg(1));
-                    return chain.proceed();
-                });
-                hooked++;
-            }
-            if (hooked == 0) {
-                throw new NoSuchMethodException("DartMessenger has no send/handleMessageFromDart");
-            }
-        });
-    }
-
-    /** 记录一条平台通道消息（按方向+通道名去重）。 */
-    private static void recordChannel(Context ctx, Set<String> seen,
-                                      java.util.concurrent.atomic.AtomicInteger dumps,
-                                      String dir, Object channel, Object message) {
-        try {
-            if (!(channel instanceof String)) {
-                return;
-            }
-            String name = (String) channel;
-            String payload = message instanceof java.nio.ByteBuffer
-                    ? readable((java.nio.ByteBuffer) message) : "";
-
-            // 应用自家的桥要逐条看：它是「一个通道 + methodName 分发」的形式，
-            // 按通道名去重只会留下第一条，真正关心的调用全被吃掉。
-            boolean detail = DETAIL_CHANNELS.contains(name);
-            String key = detail ? dir + " " + name + " " + payload : dir + " " + name;
-            if (!seen.add(key)) {
-                return;
-            }
-            if (detail && dumps.incrementAndGet() > 400) {
-                return; // 逐条模式设总量上限，避免高频往返把日志刷爆
-            }
-            ctx.log.info("flutter channel " + dir + " " + name
-                    + (payload.isEmpty() ? "" : " payload=" + payload));
-        } catch (Throwable ignored) {
-            // 测绘失败不该影响通道通信
-        }
-    }
-
-    /**
-     * 把通道消息的字节读成可读文本。
-     *
-     * <p>必须用 {@code duplicate()}：直接读会推进原 buffer 的 position，
-     * 下游解码就会拿到残缺数据——这会把应用弄坏，而且症状与本模块看起来毫无关系。</p>
-     *
-     * <p>StandardMessageCodec 用 UTF-8 编码字符串，所以按 UTF-8 解能保住中文；
-     * 长度与类型标记等二进制字节统一换成 {@code .}，只为看清结构与关键字。</p>
-     */
-    private static String readable(java.nio.ByteBuffer buf) {
-        java.nio.ByteBuffer d = buf.duplicate();
-        int len = Math.min(d.remaining(), 2048);
-        byte[] bytes = new byte[len];
-        d.get(bytes);
-        String s = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
-        StringBuilder sb = new StringBuilder(s.length());
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            sb.append(c < 0x20 || c == 0x7f ? '.' : c);
-        }
-        return sb.toString();
-    }
-
-    /**
      * 应用自家运营位的开关，全在 {@code /app/config/get} 的 {@code removeAdConfig} 里。
      *
      * <p>实测响应（已确认，非推测）：</p>
@@ -1263,7 +712,9 @@ final class Pan123Rules implements RuleSet {
      *
      * <p><b>已验证无效</b>：{@code continuousPay} / {@code loadVipBuyId} /
      * {@code loadBuyEntryMode} 一并置 0，上传页那条横幅与右下角「免广告」浮标依然存在。
-     * 结合「整个应用只有 3 个请求走 Java OkHttp」这一事实（见 {@link #PROBE_PATHS}），
+     * 结合「整个应用只有 3 个请求走 Java 层 OkHttp」这一实测事实
+     * （{@code /getconfig-api/v1/getconfig}、{@code /app/config/get}、
+     * {@code /advert_resource/get}，全在启动阶段），
      * 结论是这两处由 Dart 侧自行取数并绘制，<b>Java 层拦不到</b>。
      * 保留这三项是因为它们语义明确、置 0 无副作用，可覆盖走原生渲染的其它入口。</p>
      */
@@ -1308,69 +759,6 @@ final class Pan123Rules implements RuleSet {
 
     /** 免广告剩余时长的伪造值，取值理由见 {@link #CONFIG_PATCHES}。 */
     private static final long AD_FREE_TIME = 2000000000L;
-
-    /**
-     * 把指定接口的响应体原样打进日志，用于确定 JSON 结构。
-     *
-     * <p>写过滤规则前必须先看到真实结构：靠猜字段名改响应，要么改不动，要么把应用改崩。
-     * {@link #PROBE_PATHS} 里列的是还没吃透的接口。</p>
-     *
-     * <p>读 body 必须用 {@code peekBody(long)}——它复制一份而不消费原流。直接调
-     * {@code body().string()} 会把流读空，应用随后拿到空响应，这是改网络层最容易踩的坑。</p>
-     *
-     * <p>每个 path 只打一次：响应体可能很大。</p>
-     */
-    private void installBodyProbe(Context ctx) {
-        ctx.feature(FEAT_BODY_PROBE, () -> {
-            Class<?> builderCls = Reflect.findClass(ctx.classLoader(), "okhttp3.Response$Builder");
-            if (builderCls == null) {
-                throw new ClassNotFoundException("okhttp3.Response$Builder (not loaded)");
-            }
-            Method build = Reflect.method(builderCls, "build");
-            final Set<String> dumped = java.util.Collections.synchronizedSet(new HashSet<>(16));
-
-            ctx.hooks.intercept(FEAT_BODY_PROBE, build, chain -> {
-                Object response = chain.proceed();
-                if (response == null) {
-                    return response;
-                }
-                try {
-                    Object request = Reflect.call(response, "request");
-                    Object url = request == null ? null : Reflect.call(request, "url");
-                    if (url == null) {
-                        return response;
-                    }
-                    String full = url.toString();
-                    String matched = null;
-                    for (String p : PROBE_PATHS) {
-                        if (full.contains(p)) {
-                            matched = p;
-                            break;
-                        }
-                    }
-                    // body 为 null 的中间 Response 必须跳过：拦截器链每层都会 build 一个，
-                    // 其中不少还没有 body。若在此之前就记入 dumped，唯一的机会就被浪费掉了。
-                    if (matched == null || Reflect.call(response, "body") == null) {
-                        return response;
-                    }
-                    Method peek = Reflect.method(response.getClass(), "peekBody", long.class);
-                    Object copy = peek.invoke(response, 262144L);
-                    String text = copy == null
-                            ? null : decodeBody((byte[]) Reflect.call(copy, "bytes"));
-                    if (text == null || !dumped.add(matched)) {
-                        return response;
-                    }
-                    ctx.log.info("body " + matched + ": " + text);
-                } catch (Throwable t) {
-                    // 打 cause：反射调用的失败都被 InvocationTargetException 包了一层
-                    Throwable cause = t instanceof java.lang.reflect.InvocationTargetException
-                            ? t.getCause() : t;
-                    ctx.log.warn("body probe failed: " + (cause == null ? t : cause));
-                }
-                return response;
-            });
-        });
-    }
 
     /**
      * 清空应用自家广告接口的返回内容。
@@ -1490,60 +878,7 @@ final class Pan123Rules implements RuleSet {
     }
 
     /**
-     * 记录经过 OkHttp 的请求 URL，判断广告数据是否走 Java 网络层。
-     *
-     * <p>为什么这一步是关键：主界面由 Flutter 绘制，控件不是 Android View，
-     * 按类名或资源名隐藏对它们无效（实测切 tab 时 {@code addView} 无任何新记录）。
-     * 用户反馈的三处广告都在这一层，所以唯一的着力点是<b>数据来源</b>。</p>
-     *
-     * <p>而 {@code net stack present} 已确认 OkHttp 与 Flutter 同时存在——Flutter 应用
-     * 既可能用 Dart 的 {@code HttpClient}（走 native socket，Java 完全碰不到），
-     * 也可能通过平台通道交给 Java 的 OkHttp。这个探针就是来区分这两种情况的：
-     * 只要日志里出现业务接口 URL，就说明能在响应层动手。</p>
-     *
-     * <p>只记录 path、按 path 去重、不碰 body：URL 里常带 token 与设备标识，
-     * 完整记下来既是隐私问题也会淹掉日志；而判断「能不能拦」只需要 path。</p>
-     */
-    private void installUrlProbe(Context ctx) {
-        ctx.feature(FEAT_URL_PROBE, () -> {
-            Class<?> clientCls = Reflect.findClass(ctx.classLoader(), "okhttp3.OkHttpClient");
-            if (clientCls == null) {
-                throw new ClassNotFoundException("okhttp3.OkHttpClient (not loaded)");
-            }
-            Method newCall = Reflect.methodByArity(clientCls, "newCall", 1);
-            final Set<String> seen = java.util.Collections.synchronizedSet(new HashSet<>(128));
-
-            ctx.hooks.intercept(FEAT_URL_PROBE, newCall, chain -> {
-                try {
-                    Object request = chain.getArg(0);
-                    if (request != null) {
-                        // request.url() 返回 HttpUrl，toString() 是完整 URL
-                        Object url = Reflect.call(request, "url");
-                        if (url != null) {
-                            String path = pathOf(url.toString());
-                            if (path != null && seen.add(path)) {
-                                ctx.log.info("http path: " + path);
-                            }
-                        }
-                    }
-                } catch (Throwable ignored) {
-                    // 探针失败不能影响请求本身
-                }
-                return chain.proceed();
-            });
-        });
-    }
-
-    /** 从完整 URL 里取出 host+path，丢掉 query——query 里常有 token 与设备标识。 */
-    private static String pathOf(String url) {
-        int q = url.indexOf('?');
-        String noQuery = q < 0 ? url : url.substring(0, q);
-        // 去掉协议前缀，日志更短更好读
-        int scheme = noQuery.indexOf("://");
-        return scheme < 0 ? noQuery : noQuery.substring(scheme + 3);
-    }
-
-    /**
+     * 掐掉各家 SDK 的初始化入口。
      * 把响应字节解成可读文本，必要时先解压。
      *
      * <p>实测该接口返回的是 <b>gzip</b>：直接调 {@code ResponseBody.string()} 拿到的是乱码。
@@ -1576,93 +911,6 @@ final class Pan123Rules implements RuleSet {
         }
     }
 
-    /**
-     * 探测应用用的是哪套 HTTP 栈，只记录不改行为。
-     *
-     * <p>为什么必须先做这一步：实测主界面是 <b>Flutter</b> 绘制的（首页有
-     * {@code view id=0x1 cls=FlutterView}，APK 内含 {@code libapp.so}，且切换底部 tab
-     * 时 {@code addView} 一条新记录都没有）。Flutter 的控件不是 Android View，
-     * 画在同一张 canvas 上，所以<b>按类名或资源名隐藏对它们完全无效</b>——
-     * 用户反馈的首页轮播、右下角浮标、传输页会员条都在这一层。</p>
-     *
-     * <p>剩下的着力点只有数据层：广告内容来自网络响应。但方向取决于网络栈——
-     * 若走 Java 的 OkHttp/HttpURLConnection，可以在响应层过滤；若走 Dart 的
-     * {@code dart:io HttpClient}（native socket），Java hook 根本碰不到，
-     * 就得改从 Flutter 的平台通道或直接放弃这三处。</p>
-     *
-     * <p>所以这里先把事实探明再决定，而不是先写一堆规则再发现方向错了。</p>
-     */
-    private void installNetStackProbe(Context ctx) {
-        ctx.feature(FEAT_NET_PROBE, () -> {
-            String[] candidates = {
-                    // Java 侧：可在响应层过滤
-                    "okhttp3.OkHttpClient",
-                    "okhttp3.Interceptor",
-                    "com.android.okhttp.OkHttpClient",
-                    "retrofit2.Retrofit",
-                    "com.squareup.okhttp.OkHttpClient",
-                    // Flutter 平台通道：若存在，说明 Dart 侧可能把请求转交 Java
-                    "io.flutter.embedding.engine.FlutterEngine",
-                    "io.flutter.plugin.common.MethodChannel",
-                    "io.flutter.view.FlutterView",
-            };
-            StringBuilder present = new StringBuilder();
-            for (String cls : candidates) {
-                if (Reflect.hasClass(ctx.classLoader(), cls)) {
-                    if (present.length() > 0) {
-                        present.append(", ");
-                    }
-                    present.append(cls);
-                }
-            }
-            ctx.log.info("net stack present: " + (present.length() == 0 ? "(none)" : present));
-
-            // AnyThink 的 Flutter 桥。找它是因为通道测绘显示 Dart 侧通过 anythink_sdk 通道
-            // 发起 loadBannerAd / loadNativeAd / loadInterstitialAd / loadRewardedVideo，
-            // 而这些调用的 Java 落点就在这批 Manager 里。在 Java 侧拦它们比拦通道消息安全：
-            // 通道消息如果不放行，Dart 侧的 await 可能永远等不到回复而卡死。
-            String[] bridges = {
-                    "com.anythink.flutter.banner.ATBannerManager",
-                    "com.anythink.flutter.nativead.ATNativeManager",
-                    "com.anythink.flutter.interstitial.ATInterstitialManager",
-                    "com.anythink.flutter.rewardvideo.ATRewardVideoManager",
-                    "com.anythink.flutter.splash.ATSplashManager",
-                    "com.anythink.flutter.utils.MsgUtil",
-                    "com.anythink.flutter.AnythinkSdkPlugin",
-            };
-            StringBuilder bridge = new StringBuilder();
-            for (String cls : bridges) {
-                if (Reflect.hasClass(ctx.classLoader(), cls)) {
-                    if (bridge.length() > 0) {
-                        bridge.append(", ");
-                    }
-                    bridge.append(cls.substring(cls.lastIndexOf('.') + 1));
-                }
-            }
-            ctx.log.info("anythink flutter bridge: " + (bridge.length() == 0 ? "(none)" : bridge));
-        });
-    }
-
-    /**
-     * 只记录、不改行为：把实际加载成功的广告 SDK 打进日志。
-     *
-     * <p>这一项是后续迭代的依据——清单里列了十几家，但未必都会在运行时初始化。
-     * 有了这份名单才知道该重点堵谁，而不是盲目加规则。</p>
-     */
-    private void installProbe(Context ctx) {
-        ctx.feature(FEAT_PROBE, () -> {
-            StringBuilder present = new StringBuilder();
-            for (String cls : SDK_INIT_ENTRIES.keySet()) {
-                if (Reflect.hasClass(ctx.classLoader(), cls)) {
-                    if (present.length() > 0) {
-                        present.append(", ");
-                    }
-                    present.append(cls.substring(cls.lastIndexOf('.') + 1));
-                }
-            }
-            ctx.log.info("ad sdk present: " + (present.length() == 0 ? "(none)" : present));
-        });
-    }
 
     /**
      * 掐掉各家 SDK 的初始化入口。
