@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 只查询本模块已适配的应用是否安装。
+         不申请 QUERY_ALL_PACKAGES：模块只对已适配的固定应用生效，
+         没有理由读取全机应用列表。新增适配应用时在此追加一行。 -->
+    <queries>
+        <package android:name="com.mfcloudcalculate.networkdisk" />
+    </queries>
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:description="@string/module_description"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Purifier">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 新版 LSPosed 模块声明位于 META-INF/xposed/(module.prop + scope.list
+             + java_init.list)，不再使用旧的 xposedmodule meta-data。
+             模块描述取 application android:description。 -->
+
+        <!-- LSPosed 通过这个 Provider 把 binder 递给模块 App（调用 SEND_BINDER）。
+             authority 由框架约定为 ${applicationId}.XposedService，不可更改。
+             正常依赖 service aar 时该声明会自动合并进来；本项目改用本地 jar，
+             所以在此手写等价声明。它只响应 call(SEND_BINDER)，其余 CRUD 返回 null。 -->
+        <provider
+            android:name="io.github.libxposed.service.XposedProvider"
+            android:authorities="${applicationId}.XposedService"
+            android:exported="true"
+            tools:ignore="ExportedContentProvider" />
+
+    </application>
+
+</manifest>

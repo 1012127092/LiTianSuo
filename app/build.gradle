@@ -1,0 +1,69 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.litiansuo.purifier'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.litiansuo.purifier"
+        // libxposed api/service aar 要求 minSdk 26
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0.0"
+    }
+
+    signingConfigs {
+        release {
+            storeFile file("../release.keystore")
+            // 签名密码由 -P 参数或本地 ~/.gradle/gradle.properties 提供，不提交到仓库
+            storePassword project.findProperty("LTS_STORE_PASSWORD") ?: ""
+            keyAlias project.findProperty("LTS_KEY_ALIAS") ?: "litiansuo"
+            keyPassword project.findProperty("LTS_KEY_PASSWORD") ?: ""
+        }
+    }
+
+    buildTypes {
+        release {
+            // 模块入口类名写在 META-INF/xposed/java_init.list 里，
+            // 且大量按名字反射目标类，混淆会破坏这些约定，故关闭。
+            minifyEnabled false
+            signingConfig signingConfigs.release
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
+        }
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    compileOptions {
+        // libxposed api 102 的 class 文件版本是 61(Java 17)，
+        // 且 Invoker.Type 用了 sealed interface + record，低于 17 无法编译。
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    // ── 为什么用本地 jar 而不是 Maven 坐标 ──────────────────────────────
+    // io.github.libxposed 的 api/service/interface 三个 aar 的元数据都声明
+    // minCompileSdk=37，而本机工具链是 AGP 8.5.2 + android-34（AGP 8.5 的
+    // compileSdk 上限就是 34），直接依赖会被 checkReleaseAarMetadata 拒绝。
+    //
+    // 这三个 aar 都没有 res 资源（R.txt 为空），除 manifest 外没有需要合并的内容：
+    //   · api 本就是 compileOnly，运行时由 LSPosed 提供，编译期只需类签名；
+    //   · service 的 manifest 只贡献一个 ContentProvider 声明，已在本项目
+    //     AndroidManifest.xml 中手写等价声明；
+    //   · interface 只有 AIDL 生成的 Stub/Proxy，manifest 为空。
+    // minCompileSdk=37 反映的是上游构建环境，核对源码后确认实际只用到
+    // Bundle/IBinder/SharedPreferences/ParcelFileDescriptor/ContentProvider.call
+    // 等长期存在的 API，因此运行时不会出现 NoSuchMethodError。
+    //
+    // 代价：升级这些库需手动替换 app/libs 下的 jar，且失去 aar 元数据的前置校验。
+    compileOnly files('libs/libxposed-api-102.0.0.jar')
+    implementation files('libs/libxposed-service-102.0.0.jar')
+    implementation files('libs/libxposed-interface-102.0.0.jar')
+}

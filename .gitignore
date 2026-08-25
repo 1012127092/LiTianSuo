@@ -1,0 +1,21 @@
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+build/
+/captures
+.externalNativeBuild
+.cxx
+/app/release/
+/app/debug/
+
+# 签名密钥与密码绝不入库
+release.keystore
+*.jks
+*.p12
+keystore.properties
+
+# libxposed 的 jar 从 aar 里取出，可按 app/build.gradle 注释重新获取
+# （保留在库中反而会让升级路径不透明，但没有它无法编译，故仍纳入版本控制）
+!app/libs/*.jar
