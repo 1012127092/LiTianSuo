@@ -89,6 +89,96 @@ AnyThink 的 Dart 桥是 `anythink_sdk` 通道，能看到 `loadBannerAd` /
 
 比逐个字段试开关高效得多：一次实验换一个确定结论。
 
+### 突破口：Flutter 的 shared_preferences 落在 Java 层
+
+Flutter 的 `shared_preferences` 插件最终写的就是 Android `SharedPreferences`
+（文件 `FlutterSharedPreferences`，键名带 `flutter.` 前缀），读取走 `getAll()`。
+**所以 Dart 侧的持久化数据反而是 Java hook 能碰到的**，比平台通道更靠底层。
+
+这解释了为什么之前改 HTTP 和通道都无效：**Dart 读的是自己缓存的那一份。**
+首次启动时缓存已写好，之后就不再理会接口返回什么。
+
+键名测绘（hook `SharedPreferencesImpl.getAll`）拿到 35 个键，关键的几类：
+
+```
+flutter.interface_config            Dart 侧全部接口 URL（200+ 个）
+flutter.ownAdInfo_ / _<uid>         自家广告内容缓存
+flutter.lastOwnAdNo_<uid>_2001      各位置最近一条广告号
+flutter.lastShowAdType_<uid>_2001/2002/2005
+flutter.lastOwnAdTime_<uid>_30004
+flutter.button_upload / _download / _quit / _user_center /
+        _return_file / _splash_screen        ← 与 HTTP 同名，各存一份
+flutter.removeAdsEffect / flutter.removeAdsTime
+flutter.TrackingInfo                {"loginStatus","vipType","vipSub",...}
+```
+
+那些 2001 / 2002 / 30004 正是 `advert_resource/get` 里 `data.list` 的位置号。
+
+**探针必须逐个 prefs 文件都 dump**：应用会打开多个 prefs 文件（自家的、Flutter 的、
+各 SDK 的），只记第一个非空的会漏掉真正想找的那个 —— 上一轮就是这么漏的，
+错误地得出「prefs 里只有 lastVersionCodeUsed」。
+
+`getAll()` 返回的是内部 map 的副本（`new HashMap<>(mMap)`），改它不污染真正的
+prefs，磁盘文件也不会被改写。
+
+### interface_config：Java 层唯一能碰到 Dart 网络请求的地方
+
+Dart 用 `dart:io HttpClient` 走 native socket，请求本身 Java 看不见 ——
+但请求用的**地址**来自 `flutter.interface_config`，而它存在 prefs 里。
+
+里面有 200 多个接口 URL，与广告相关的两个：
+
+```
+adFreeConfig     /api/restful/goapi/v1/remove_ads/config   免广告配置
+advertALiReport  /api/restful/goapi/v1/advert/ali/report   广告曝光上报
+```
+
+只断 `advertALiReport`（纯统计，无功能损失）。**`adFreeConfig` 刻意不断**：
+试过对浮标无效，而它是「看广告换 24 小时免广告」的配置接口，
+断掉反而剥夺用户真要用这功能时的选择 —— 既无收益又有代价。
+
+改 URL 用 `127.0.0.1:1` 而不是空串：空串可能让 Dart 抛 `FormatException`
+落进未预料的分支；合法但连不上的地址走正常的「请求失败」路径，
+是应用本来就会处理的情况。手写字符串替换而不解析 JSON —— 200 多个字段结构未知，
+解析再序列化有改坏其它字段的风险。
+
+### AnyThink 的 Dart 桥才是弹窗广告的来源
+
+`sdk-init` 拦的是 `ATSDK.init` 这类静态入口，但 **Flutter 插件这条路径完全独立**，
+Dart 侧照样能发 `loadInterstitialAd` / `loadNativeAd` / `loadBannerAd` /
+`loadRewardedVideo`。这解释了为什么 SDK 初始化明明被拦住，弹窗还是会出现。
+
+hook 点：`AnythinkSdkPlugin.onMethodCall` **不存在**
+（`NoSuchMethodException params=2`）—— 插件把处理器注册为 lambda 或内部类。
+改为在 `MethodCall` 构造函数里按方法名前缀识别，命中就把 `method` 字段改掉，
+让插件的分发落到「未知方法」分支自然回 `notImplemented`。
+
+改方法名而不是清空参数：参数结构 Dart 侧不检查，清空未必阻止加载；
+方法名不匹配则一定走不到加载逻辑。`notImplemented` 对 Dart 是明确的
+「功能不存在」，比无限等待安全。
+
+前缀判断还要求 `Ad` / `Video` 后缀，否则会误伤应用自家桥上的正常 `loadXxx`。
+
+### 已排除的方向（不要重试）
+
+| 试过什么 | 确认生效的日志 | 结果 |
+|---|---|---|
+| HTTP 改 `removeAdConfig` 全部 `button_*` | `patched config` | 传输页 3→1，浮标不动 |
+| HTTP 改 `continuousPay`/`loadVipBuyId`/`loadBuyEntryMode`/`BuyRemoveAds` | 同上 | 全部无效 |
+| 桥参数按键名就地改 | `bridge args patched: 7 key(s)` | 浮标不动 |
+| prefs 伪造 `isVip=1`（读取侧） | `prefs isVip -> "1"` ×3 | 浮标不动 |
+| prefs 改 `removeAdsEffect=0` | `prefs ad switches off: 1` | 浮标不动 |
+| prefs 改 `TrackingInfo.vipType=1` | `TrackingInfo vipType -> 1` | 浮标不动 |
+| 断 `adFreeConfig` 接口 | `ad endpoints broken: 2` | 浮标不动 |
+| 改 `firstPrice=123` 观察横幅价格 | —— | 仍显示 ¥6.00 |
+
+最后一条是判别实验：**一次实验换一个确定结论**，比逐个字段试开关高效得多。
+它证明那些 Flutter 自绘的位置不读这份配置。
+
+`TrackingInfo` 那条也说明了问题 —— 名字就是 Tracking，只是埋点上报的快照，
+不参与界面判断。会员状态的真实来源在 Dart 内存里，由那些 Java 看不见的
+业务请求直接填充。
+
 ### 主界面是 Flutter，UI 层拦不住应用自家运营位
 
 三条独立证据：APK 内含 `libapp.so`；首页有 `view id=0x1 cls=FlutterView`；
@@ -290,32 +380,30 @@ LSPosed 管理器 2.1.1。参考模块酷安净化（`io.github.yylsping.coolapk
 |---|---|---|
 | 开屏广告 | 已消除 | `frame_ad_splash_container` 置 GONE + 掐 7 家 SDK init |
 | 开屏卡顿（bid timeout） | 已消除 | 拦 `ATSDK.init/start` |
+| 弹窗/插屏广告 | 已消除 | 改 `MethodCall.method` 让 AnyThink 加载调用落空 |
 | 首页轮播广告 | 已消除 | `advert_resource/get` 的 `data.list` 置空 |
+| 自家运营位缓存 | 已清空 | prefs 里 `flutter.ownAdInfo*` 置空串 |
+| 广告曝光上报 | 已断开 | `interface_config.advertALiReport` 指向死地址 |
 | 传输页会员横幅 | 3 条 → 1 条 | `removeAdConfig.button_*` 置 0 |
-| 传输页上传屏横幅 | **拦不到** | 数据由 Dart 侧自取，判别实验已定性 |
+| 上传屏横幅 | **拦不到** | Dart 自绘自取，8 种手段全部证伪 |
 | 右下角「免广告」浮标 | **拦不到** | 同上 |
 
 遍历四个 tab 全程 `E`（错误）计数为 0，应用工作正常。
 
 ## 剩余两处为什么拦不到
 
-三条手段全部试过并确认无效：
+见上文「已排除的方向」表：8 种手段每一种都确认生效（有 `H` 命中日志），
+但那两处一动不动。判别实验（改 `firstPrice` 观察横幅价格）证明它们不读
+Java 能碰到的任何配置。
 
-1. HTTP 响应改 `removeAdConfig` 全部 `button_*` + `continuousPay` /
-   `loadVipBuyId` / `loadBuyEntryMode` / `BuyRemoveAds` / `remove_ads_effect`
-2. Flutter 桥参数按键名就地改（`bridge args patched: 7 key(s)` 确认生效）
-3. `SharedPreferences` 读取侧伪造 `isVip=1`（`prefs isVip -> "1"` 确认生效）
+结论：数据在 Dart 侧自取自绘 —— 业务请求走 `dart:io` native socket，
+渲染走 Skia，中间不经过任何 Java 对象。要继续只剩两条路，都超出本模块范畴：
 
-判别实验（改 `firstPrice` 观察横幅价格是否变化）证明那两处不读这份配置。
-结论：数据在 Dart 侧自取自绘，Java hook 完全无法介入。
-
-要继续只剩两条路，都超出本模块范畴：
-
-- 改 `libapp.so`（Dart AOT 机器码，需重打包，且破坏签名与完整性校验）
+- 改 `libapp.so`（Dart AOT 机器码，需重打包，破坏签名与完整性校验）
 - Frida 之类的 native 层 hook（需要 root 或注入器）
 
-**不要再往 `CONFIG_PATCHES` 或 `AD_OFF_KEYS` 里加字段试。** 已经用一次判别实验
-把这条路彻底定性了，继续加字段只是重复已被否定的方向。
+**不要再往 `CONFIG_PATCHES` / `AD_OFF_KEYS` / prefs 补丁里加字段试。**
+已排除方向表就是为了防止重走这些路。
 
 ## 已知降级项
 

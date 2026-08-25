@@ -66,6 +66,8 @@ final class Pan123Rules implements RuleSet {
     private static final String FEAT_BRIDGE = "native-bridge";
     /** AnyThink Flutter 桥拦截：掐掉 Dart 侧发起的广告加载请求。 */
     private static final String FEAT_AT_BRIDGE = "anythink-bridge";
+    /** 自家广告缓存清理：清掉 Dart 侧存在 prefs 里的运营位内容。 */
+    private static final String FEAT_OWN_AD = "own-ad-cache";
     /**
      * 本地会员标记伪造：让 Dart 侧以为已开通会员，从而不展示「非会员才显示」的推广位。
      *
@@ -108,6 +110,30 @@ final class Pan123Rules implements RuleSet {
     ));
 
     /**
+     * 需要强制<b>开启</b>的键：免广告功能开关。
+     *
+     * <p>与 {@link #AD_OFF_KEYS} 相反。它与 {@link #AD_TIME_KEYS} 成对使用——
+     * 开关为真、时长顶满，才表示「免广告权益正在生效」。
+     * 把开关置 0 会让时长根本不被检查。</p>
+     *
+     * <p>两种写法都列上：HTTP 与桥用下划线，Flutter prefs 用小驼峰。</p>
+     */
+    private static final Set<String> AD_ON_KEYS = new HashSet<>(java.util.Arrays.asList(
+    ));
+
+    /**
+     * {@code removeAdsEffect} 判别实验结论：置 0 对浮标无效，故不再改它。
+     *
+     * <p>浮标写着「免广告」，点开是「连续看 3 个广告可获得 24 小时免广告权益」，
+     * 看起来浮标就是这个功能的入口。但 prefs 层把 {@code removeAdsEffect} 置 0 后
+     * （日志确认 {@code prefs ad switches off: 1 key(s)}）浮标依旧存在，
+     * 说明它只控制权益是否生效，不控制入口是否展示。</p>
+     *
+     * <p>保留空集合而非删掉这段：记录已排除的方向，避免以后重试。</p>
+     */
+    private static final Set<String> AD_EFFECT_KEYS = java.util.Collections.emptySet();
+
+    /**
      * 需要逐条记录 payload 的通道。
      *
      * <p>{@code com.wisdom.water.main} 是应用自家的原生桥，实测形如
@@ -118,7 +144,20 @@ final class Pan123Rules implements RuleSet {
      */
     private static final Set<String> DETAIL_CHANNELS = new HashSet<>(java.util.Arrays.asList(
             "com.wisdom.water.main",
-            "anythink_sdk"
+            "anythink_sdk",
+            // Flutter 官方 shared_preferences 的 pigeon 通道。浮标有「关闭」按钮，
+            // 说明关闭状态一定被持久化在某处；原生 prefs 只有 lastVersionCodeUsed，
+            // 所以状态大概率写在 Dart 侧这条通道上。
+            "dev.flutter.pigeon.SharedPreferencesApi.setBool",
+            "dev.flutter.pigeon.SharedPreferencesApi.setString",
+            "dev.flutter.pigeon.SharedPreferencesApi.setInt",
+            "dev.flutter.pigeon.SharedPreferencesApi.getAll",
+            "dev.flutter.pigeon.SharedPreferencesApi.getKeys",
+            "dev.flutter.pigeon.SharedPreferencesAsyncApi.setBool",
+            "dev.flutter.pigeon.SharedPreferencesAsyncApi.setString",
+            "dev.flutter.pigeon.SharedPreferencesAsyncApi.setInt",
+            "dev.flutter.pigeon.SharedPreferencesAsyncApi.getAll",
+            "dev.flutter.pigeon.SharedPreferencesAsyncApi.getKeys"
     ));
 
     /**
@@ -412,8 +451,381 @@ final class Pan123Rules implements RuleSet {
         installNativeBridgeFilter(ctx);
         installAnyThinkBridgeBlock(ctx);
         installVipFlagOverride(ctx);
+        installOwnAdCacheFilter(ctx);
         installAdApiFilter(ctx);
         installSdkInitBlock(ctx);
+    }
+
+    /**
+     * 清掉 Dart 侧缓存的自家广告数据。
+     *
+     * <p><b>这是右下角浮标的真正数据来源。</b>键名测绘发现 Flutter 的
+     * {@code FlutterSharedPreferences} 里存着一整套自家广告缓存：</p>
+     * <pre>
+     * flutter.ownAdInfo_ / flutter.ownAdInfo_&lt;uid&gt;   自家广告内容
+     * flutter.lastOwnAdNo_&lt;uid&gt;_2001                 各位置最近一条广告号
+     * flutter.lastShowAdType_&lt;uid&gt;_2001/2002/2005    各位置最近展示类型
+     * flutter.lastOwnAdTime_&lt;uid&gt;_30004              各位置最近展示时间
+     * </pre>
+     *
+     * <p>那些 2001 / 2002 / 30004 正是 {@code advert_resource/get} 响应里
+     * {@code data.list} 的位置号——也就是说<b>接口被我们清空了，但 Dart 侧还留着
+     * 上次的缓存，照样能把广告画出来</b>。这解释了为什么清空接口对浮标毫无效果。</p>
+     *
+     * <p>关键前提：Flutter 的 {@code shared_preferences} 最终落在 Java 层的
+     * {@code SharedPreferencesImpl}，读取走 {@code getAll()}。所以这份 Dart 数据
+     * 反而是 Java hook 能碰到的——比通道更靠底层。</p>
+     *
+     * <p>{@code getAll()} 返回的是内部 map 的副本（{@code new HashMap<>(mMap)}），
+     * 改它不会污染真正的 prefs，磁盘文件也不会被改写。</p>
+     *
+     * <p><b>只删内容缓存，不动频次记录</b>：{@code lastOwnAd*} / {@code lastShowAdType*}
+     * 是「这个位置上次展示了什么、什么时候」，删掉反而可能被理解成「从未展示过」
+     * 而立刻补一次。内容没了广告自然画不出来，频次记录留着无害。</p>
+     */
+    private void installOwnAdCacheFilter(Context ctx) {
+        ctx.feature(FEAT_OWN_AD, () -> {
+            Class<?> prefsCls = Reflect.findClass(ctx.classLoader(),
+                    "android.app.SharedPreferencesImpl");
+            if (prefsCls == null) {
+                throw new ClassNotFoundException("android.app.SharedPreferencesImpl");
+            }
+            Method getAll = Reflect.method(prefsCls, "getAll");
+            Method getString = Reflect.method(prefsCls, "getString", String.class, String.class);
+
+            ctx.hooks.intercept(FEAT_OWN_AD, getAll, chain -> {
+                Object all = chain.proceed();
+                if (!(all instanceof Map)) {
+                    return all;
+                }
+                @SuppressWarnings("unchecked")
+                Map<String, Object> map = (Map<String, Object>) all;
+                int cleared = 0;
+                for (Map.Entry<String, Object> e : map.entrySet()) {
+                    if (!isOwnAdCacheKey(e.getKey())) {
+                        continue;
+                    }
+                    Object v = e.getValue();
+                    // 保持原类型：Dart 按声明类型解码，类型不符会抛异常。
+                    // 空字符串 / 空集合表示「没有广告」，比 null 安全——
+                    // 缺键可能触发「首次运行」分支去重新拉取。
+                    if (v instanceof String) {
+                        if (((String) v).isEmpty()) {
+                            continue;
+                        }
+                        e.setValue("");
+                        cleared++;
+                    } else if (v instanceof Set) {
+                        if (((Set<?>) v).isEmpty()) {
+                            continue;
+                        }
+                        e.setValue(new HashSet<String>());
+                        cleared++;
+                    }
+                }
+                int off = forceAdSwitchesOff(map);
+                int urls = breakAdEndpoints(ctx, map);
+                if (cleared > 0) {
+                    ctx.log.hit("own-ad cache cleared: " + cleared + " key(s)");
+                }
+                if (off > 0) {
+                    ctx.log.hit("prefs ad switches off: " + off + " key(s)");
+                }
+                if (urls > 0) {
+                    ctx.log.hit("ad endpoints broken: " + urls);
+                }
+                return map;
+            });
+
+            // shared_preferences 新版会逐键读而不是整体 getAll，两条路都得堵
+            ctx.hooks.intercept(FEAT_OWN_AD + "-get", getString, chain -> {
+                Object key = chain.getArg(0);
+                if (!(key instanceof String) || !isOwnAdCacheKey((String) key)) {
+                    return chain.proceed();
+                }
+                ctx.log.hit("own-ad cache read blocked: " + key);
+                return "";
+            });
+        });
+    }
+
+    /**
+     * 判断一个 prefs 键是否是自家广告的<b>内容</b>缓存。
+     *
+     * <p>只认内容类键。频次记录（{@code lastOwnAdNo} / {@code lastOwnAdTime} /
+     * {@code lastShowAdType}）刻意排除在外，理由见
+     * {@link #installOwnAdCacheFilter}。</p>
+     *
+     * <p>用前缀匹配而不是完整键名：键名里带用户 id 与位置号
+     * （{@code flutter.ownAdInfo_1811711495}），写死等于只对一个账号有效。</p>
+     */
+    private static boolean isOwnAdCacheKey(String key) {
+        return key.startsWith("flutter.ownAdInfo");
+    }
+
+    /**
+     * 把 Flutter prefs 里的去广告开关强制置成「已开启免广告」。
+     *
+     * <p>键名测绘的关键发现：{@code button_upload} / {@code button_download} /
+     * {@code button_quit} / {@code button_user_center} / {@code button_return_file} /
+     * {@code button_splash_screen} / {@code removeAdsEffect} / {@code removeAdsTime}
+     * <b>在 Flutter prefs 里各有一份</b>。</p>
+     *
+     * <p>这解释了此前所有努力为何无效：我们改的是 HTTP 响应和通道参数，
+     * 但 Dart 侧读的是<b>自己缓存的这一份</b>。首次启动时缓存已经写好，
+     * 之后就不再理会接口返回什么。</p>
+     *
+     * <p>{@code button_*} 语义已由实测确认（HTTP 侧置 0 使传输页横幅 3 条降到 1 条），
+     * 所以这里同样置 0；{@code removeAdsEffect} 保持开启、{@code removeAdsTime} 顶满，
+     * 理由见 {@link #CONFIG_PATCHES}。</p>
+     *
+     * @return 实际改动的键数
+     */
+    private static int forceAdSwitchesOff(Map<String, Object> map) {
+        int changed = 0;
+        for (Map.Entry<String, Object> e : map.entrySet()) {
+            String key = e.getKey();
+            if (!key.startsWith(FLUTTER_PREFIX)) {
+                continue;
+            }
+            String name = key.substring(FLUTTER_PREFIX.length());
+            Object v = e.getValue();
+            if (AD_TIME_KEYS.contains(name)) {
+                Object now = asSameType(v, AD_FREE_TIME);
+                if (now != null && !now.equals(v)) {
+                    e.setValue(now);
+                    changed++;
+                }
+            } else if (AD_EFFECT_KEYS.contains(name)) {
+                // 判别实验：置 0 看浮标（免广告入口）是否消失
+                Object now = asSameType(v, 0L);
+                if (now != null && !now.equals(v)) {
+                    e.setValue(now);
+                    changed++;
+                }
+            } else if (AD_ON_KEYS.contains(name)) {
+                Object now = asSameType(v, 1L);
+                if (now != null && !now.equals(v)) {
+                    e.setValue(now);
+                    changed++;
+                }
+            } else if (AD_OFF_KEYS.contains(name)) {
+                Object now = asSameType(v, 0L);
+                if (now != null && !now.equals(v)) {
+                    e.setValue(now);
+                    changed++;
+                }
+            }
+        }
+        return changed;
+    }
+
+    /**
+     * 把一个数值按 {@code sample} 的实际类型转换。
+     *
+     * <p>prefs 里同一个语义的字段在不同版本可能存成 bool / int / long / String，
+     * 而 Dart 按声明类型解码，类型不符会直接抛异常。所以只能照原样返回，
+     * 遇到无法处理的类型返回 {@code null} 表示「不动它」。</p>
+     */
+    private static Object asSameType(Object sample, long value) {
+        if (sample instanceof Boolean) {
+            return value != 0;
+        }
+        if (sample instanceof Integer) {
+            // long 超出 int 范围时截断没有意义，取 int 上限
+            return value > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) value;
+        }
+        if (sample instanceof Long) {
+            return value;
+        }
+        if (sample instanceof String) {
+            return String.valueOf(value);
+        }
+        return null;
+    }
+
+    /** Flutter {@code shared_preferences} 给每个键加的前缀。 */
+    private static final String FLUTTER_PREFIX = "flutter.";
+
+    /**
+     * 打印几个与浮标有关的 prefs 值，用于判断浮标数据究竟藏在哪。
+     *
+     * <p>{@code interface_config} 是最可疑的：名字就是「界面配置」，
+     * 而浮标是个跨页面常驻的界面元素。{@code ownAdInfo} 打印内容确认清空是否真的生效，
+     * {@code ac_*} 与 {@code lastOwnAd*} 用于对照位置号。</p>
+     *
+     * <p>只在值变化时打印，避免高频读取刷爆日志。</p>
+     */
+    private static void dumpInterestingValues(Context ctx, Map<String, Object> map) {
+        for (Map.Entry<String, Object> e : map.entrySet()) {
+            String key = e.getKey();
+            if (!isProbeValueKey(key)) {
+                continue;
+            }
+            Object v = e.getValue();
+            String text = String.valueOf(v);
+            // 长值分片打印而不是截断：interface_config 里是 Dart 侧的全部接口 URL，
+            // 取广告那条可能在任何位置，截断就看不见了。
+            for (int i = 0; i < text.length() && i < 12000; i += 700) {
+                String part = text.substring(i, Math.min(text.length(), i + 700));
+                String line = key + "[" + i + "] = " + part;
+                if (VALUE_SEEN.size() < 80 && VALUE_SEEN.add(line)) {
+                    ctx.log.info("prefs value " + line);
+                }
+            }
+        }
+    }
+
+    /** 已打印过的 prefs 值，避免重复。 */
+    private static final Set<String> VALUE_SEEN =
+            java.util.Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
+    /**
+     * 把 Dart 侧取广告的接口地址改成无效地址。
+     *
+     * <p><b>这是 Java 层唯一能碰到 Dart 网络请求的地方。</b>Dart 用
+     * {@code dart:io HttpClient} 走 native socket，请求本身 Java 看不见；
+     * 但请求用的<b>地址</b>来自 {@code flutter.interface_config}，
+     * 而这份配置存在 prefs 里、经 Java 层的 {@code SharedPreferencesImpl} 读出。</p>
+     *
+     * <p>实测这份配置里有 200 多个接口 URL，其中与广告直接相关的两个：</p>
+     * <pre>
+     * adFreeConfig     /api/restful/goapi/v1/remove_ads/config   免广告配置
+     * advertALiReport  /api/restful/goapi/v1/advert/ali/report   广告曝光上报
+     * </pre>
+     *
+     * <p>浮标是「免广告」入口，{@code adFreeConfig} 正是它的数据来源。
+     * 把地址改成保证连不通的形式，Dart 侧请求失败 → 拿不到配置 → 画不出浮标。</p>
+     *
+     * <p>用 {@code 127.0.0.1:1} 而不是空串或垃圾字符：空串可能让 Dart 抛
+     * {@code FormatException} 而不是网络错误，落进未预料的分支；
+     * 合法但连不上的地址会走正常的「请求失败」路径，是应用本来就会处理的情况。</p>
+     *
+     * <p><b>只改广告相关的，其余 200 多个业务接口一个都不动</b>——
+     * 改错一个就是整个功能不可用。</p>
+     *
+     * @return 改动的地址数
+     */
+    private static int breakAdEndpoints(Context ctx, Map<String, Object> map) {
+        Object raw = map.get("flutter.interface_config");
+        if (!(raw instanceof String)) {
+            return 0;
+        }
+        String json = (String) raw;
+        String patched = json;
+        int n = 0;
+        for (String key : AD_ENDPOINT_KEYS) {
+            String next = replaceJsonUrl(patched, key);
+            if (!next.equals(patched)) {
+                patched = next;
+                n++;
+            }
+        }
+        if (n == 0) {
+            return 0;
+        }
+        map.put("flutter.interface_config", patched);
+        return n;
+    }
+
+    /**
+     * 把 JSON 里 {@code "key":"<url>"} 的地址部分换成死地址。
+     *
+     * <p>手写替换而不是解析 JSON：这份配置有 200 多个字段、结构未知，
+     * 解析再序列化有改坏其它字段的风险，而这里只需要动一个值。</p>
+     */
+    private static String replaceJsonUrl(String json, String key) {
+        String needle = "\"" + key + "\":\"";
+        int at = json.indexOf(needle);
+        if (at < 0) {
+            return json;
+        }
+        int from = at + needle.length();
+        int end = json.indexOf('"', from);
+        if (end < 0) {
+            return json;
+        }
+        if (json.startsWith(DEAD_URL, from)) {
+            return json;
+        }
+        return json.substring(0, from) + DEAD_URL + json.substring(end);
+    }
+
+    /**
+     * 广告相关的接口字段名，取自实测的 {@code interface_config}。
+     *
+     * <p>只留曝光上报：它纯粹是广告统计，断掉没有任何用户可见的功能损失。</p>
+     *
+     * <p><b>刻意不含 {@code adFreeConfig}</b>：试过，浮标不受影响
+     * （日志确认 {@code ad endpoints broken: 2} 时浮标仍在），
+     * 说明浮标数据不来自它；而它是「看广告换 24 小时免广告」那个功能的配置接口，
+     * 断掉反而剥夺了用户真要用这功能时的选择。既无收益又有代价，不留。</p>
+     */
+    private static final String[] AD_ENDPOINT_KEYS = {
+            "advertALiReport",
+    };
+
+    /**
+     * 死地址：语法合法但保证连不上。
+     *
+     * <p>回环地址保证不会打到真实主机，端口 1 属于特权端口、普通应用连不上。
+     * 斜杠保持 {@code interface_config} 原有的 {@code \/} 转义写法。</p>
+     */
+    private static final String DEAD_URL = "http:\\/\\/127.0.0.1:1\\/blocked";
+
+    /**
+     * 把 {@code flutter.TrackingInfo} 里的会员标记改成已开通。
+     *
+     * <p>实测原值：{@code {"loginStatus":"1","vipType":"0","vipSub":"0",
+     * "developSub":"0","packType":"0"}}。</p>
+     *
+     * <p><b>这是比 {@code isVip} 更可信的会员状态来源</b>：{@code isVip} 存在应用自家的
+     * prefs 里、由原生桥读写，而这份 {@code TrackingInfo} 由 Dart 侧
+     * 直接经 {@code SharedPreferencesApi.setString} 写入——也就是说
+     * <b>Dart 自己认这一份</b>。浮标是「非会员才展示」的推广位，
+     * 之前改 {@code isVip} 无效，很可能就是改错了地方。</p>
+     *
+     * <p>只改 {@code vipType}，不动 {@code vipSub} / {@code developSub} / {@code packType}：
+     * 那几个是订阅方式与套餐类型，含义未确认，乱改可能落进未预料的分支。</p>
+     *
+     * @return 改动数（0 或 1）
+     */
+    /**
+     * 判别实验（已完成，结论：无效，故不再调用）：把 {@code flutter.TrackingInfo} 的
+     * {@code vipType} 改成 1。
+     *
+     * <p>原值 {@code {"loginStatus":"1","vipType":"0",...}}，由 Dart 侧直接经
+     * {@code SharedPreferencesApi.setString} 写入，看起来比原生桥的 {@code isVip}
+     * 更可信。实测改成 1（日志确认 {@code TrackingInfo vipType -> 1}）后浮标仍在。</p>
+     *
+     * <p>结论：{@code TrackingInfo} 只是埋点上报用的快照（名字就是 Tracking），
+     * 不参与界面判断。会员状态的真实来源在 Dart 内存里，由那些 Java 看不见的
+     * 业务请求直接填充。</p>
+     *
+     * <p>保留代码而非删除：这是个语义明确、成本很低的探针，
+     * 若以后应用改版把 {@code TrackingInfo} 变成真状态源，直接接回调用即可。</p>
+     */
+    private static int patchTrackingInfoDisabled(Context ctx, Map<String, Object> map) {
+        Object raw = map.get("flutter.TrackingInfo");
+        if (!(raw instanceof String)) {
+            return 0;
+        }
+        String json = (String) raw;
+        String patched = json.replace("\"vipType\":\"0\"", "\"vipType\":\"1\"");
+        if (patched.equals(json)) {
+            return 0;
+        }
+        map.put("flutter.TrackingInfo", patched);
+        return 1;
+    }
+
+    /** 判断是否是需要打印内容的探测键。 */
+    private static boolean isProbeValueKey(String key) {
+        return key.equals("flutter.interface_config")
+                || key.startsWith("flutter.ownAdInfo")
+                || key.startsWith("flutter.ac_")
+                || key.startsWith("flutter.lastOwnAd")
+                || key.startsWith("flutter.lastShowAdType");
     }
 
     /**
@@ -523,22 +935,30 @@ final class Pan123Rules implements RuleSet {
             Method getBoolean = Reflect.method(prefsCls, "getBoolean", String.class, boolean.class);
             Method getAll = Reflect.method(prefsCls, "getAll");
 
-            // 键名测绘：Dart 侧的 shared_preferences 全部落在这里（键名带 flutter. 前缀），
+            // 键名测绘：Dart 侧的 shared_preferences 也落在这里（键名带 flutter. 前缀），
             // 浮标之类「可手动关闭」的组件必然存了关闭状态，先看清有哪些键才能定点覆盖。
-            final java.util.concurrent.atomic.AtomicBoolean dumped =
-                    new java.util.concurrent.atomic.AtomicBoolean();
+            //
+            // 必须逐个 prefs 文件都 dump：应用会打开多个 prefs 文件
+            // （自家的、Flutter 的 FlutterSharedPreferences、各 SDK 的），
+            // 只记第一个非空的会漏掉真正想找的那个——上一轮就是这么漏的。
+            final Set<String> dumped = java.util.Collections.newSetFromMap(
+                    new ConcurrentHashMap<String, Boolean>());
             ctx.hooks.intercept(FEAT_VIP + "-keys", getAll, chain -> {
                 Object all = chain.proceed();
-                if (all instanceof Map && !((Map<?, ?>) all).isEmpty()
-                        && dumped.compareAndSet(false, true)) {
-                    StringBuilder sb = new StringBuilder();
-                    for (Object k : ((Map<?, ?>) all).keySet()) {
-                        if (sb.length() > 0) {
-                            sb.append(" | ");
-                        }
-                        sb.append(k);
+                if (!(all instanceof Map) || ((Map<?, ?>) all).isEmpty()) {
+                    return all;
+                }
+                StringBuilder sb = new StringBuilder();
+                for (Object k : ((Map<?, ?>) all).keySet()) {
+                    if (sb.length() > 0) {
+                        sb.append(" | ");
                     }
-                    ctx.log.info("prefs keys: " + sb);
+                    sb.append(k);
+                }
+                String keys = sb.toString();
+                // 按键集合去重而非按次数：同一文件被反复读取，但键集合变化时要能看到
+                if (dumped.size() < 40 && dumped.add(keys)) {
+                    ctx.log.info("prefs keys: " + keys);
                 }
                 return all;
             });
