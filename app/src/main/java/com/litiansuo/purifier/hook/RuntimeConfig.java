@@ -71,8 +71,10 @@ public final class RuntimeConfig {
     private void apply(android.content.SharedPreferences prefs, String packageName) {
         Set<String> on = prefs.getStringSet(
                 com.litiansuo.purifier.core.PrefKeys.KEY_ENABLED_PACKAGES, null);
-        // 键不存在（用户还没进过模块界面）视为启用，避免「装了没反应」
-        this.enabled = (on == null) || on.contains(packageName);
+        // 键不存在或为空集合都视为启用，避免「装了没反应」。
+        // 空集合必须与 null 同等对待：用户把唯一一个应用关掉再打开，中间态就是空集合，
+        // 若判为禁用会与界面「未配置即启用」的显示不一致。禁用由「集合非空且不含本包」表达。
+        this.enabled = (on == null) || on.isEmpty() || on.contains(packageName);
         this.verbose = prefs.getBoolean(com.litiansuo.purifier.core.PrefKeys.KEY_VERBOSE_LOG, false);
         log.setVerbose(this.verbose);
 

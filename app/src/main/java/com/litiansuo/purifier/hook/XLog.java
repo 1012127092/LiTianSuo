@@ -36,6 +36,7 @@ public final class XLog implements FeatureGuard.Logger {
     @Override
     public void info(String msg) {
         Log.i(TAG, msg);
+        FileLog.write("I " + msg);
         if (xposed != null) {
             xposed.log(Log.INFO, TAG, msg);
         }
@@ -44,6 +45,7 @@ public final class XLog implements FeatureGuard.Logger {
     @Override
     public void warn(String msg) {
         Log.w(TAG, msg);
+        FileLog.write("W " + msg);
         if (xposed != null) {
             xposed.log(Log.WARN, TAG, msg);
         }
@@ -51,6 +53,7 @@ public final class XLog implements FeatureGuard.Logger {
 
     @Override
     public void error(String msg, Throwable t) {
+        FileLog.write("E " + msg + (t == null ? "" : " :: " + t));
         if (t == null) {
             Log.e(TAG, msg);
             if (xposed != null) {
@@ -64,10 +67,23 @@ public final class XLog implements FeatureGuard.Logger {
         }
     }
 
-    /** 命中类日志，仅在 verbose 打开时输出。调用点不需要自己判断开关。 */
+    /**
+     * 命中类日志。
+     *
+     * <p>logcat 与 LSPosed 日志受 {@code verbose} 控制（量大且会拖慢目标应用），
+     * 但<b>文件通道始终写</b>：命中记录是验证规则是否真的起作用的唯一直接证据，
+     * 而命中次数本身是有界的——只有真的遇到广告才会触发，不像测绘那样随滑动线性增长。</p>
+     *
+     * <p>之前把整个 hit 都关在 verbose 后面，导致「规则装上了但看不到任何命中」，
+     * 白白把日志缺失误判成规则失效。</p>
+     */
     public void hit(String msg) {
+        FileLog.write("H " + msg);
         if (verbose) {
-            info(msg);
+            Log.i(TAG, msg);
+            if (xposed != null) {
+                xposed.log(Log.INFO, TAG, msg);
+            }
         }
     }
 }
