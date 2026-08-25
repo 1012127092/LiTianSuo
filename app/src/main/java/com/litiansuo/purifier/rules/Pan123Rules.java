@@ -64,6 +64,8 @@ final class Pan123Rules implements RuleSet {
     private static final String FEAT_FLUTTER = "flutter-probe";
     /** 原生桥过滤：在应用自家 Flutter 桥上改掉去广告开关。 */
     private static final String FEAT_BRIDGE = "native-bridge";
+    /** AnyThink Flutter 桥拦截：掐掉 Dart 侧发起的广告加载请求。 */
+    private static final String FEAT_AT_BRIDGE = "anythink-bridge";
     /**
      * 本地会员标记伪造：让 Dart 侧以为已开通会员，从而不展示「非会员才显示」的推广位。
      *
@@ -100,7 +102,6 @@ final class Pan123Rules implements RuleSet {
             "button_quit",
             "button_user_center",
             "button_return_file",
-            "remove_ads_effect",
             "isPreloadSplash",
             "isPreloadInter",
             "isOpenSplash"
@@ -409,9 +410,87 @@ final class Pan123Rules implements RuleSet {
         installBodyProbe(ctx);
         installFlutterChannelProbe(ctx);
         installNativeBridgeFilter(ctx);
+        installAnyThinkBridgeBlock(ctx);
         installVipFlagOverride(ctx);
         installAdApiFilter(ctx);
         installSdkInitBlock(ctx);
+    }
+
+    /**
+     * 掐掉 Dart 侧发起的 AnyThink 广告请求。
+     *
+     * <p><b>这是弹窗、原生广告、横幅的真正来源。</b>通道测绘抓到 Dart 侧持续调用：</p>
+     * <pre>
+     * anythink_sdk loadNativeAd      placementID=b693bea4da4576 / b693bea67177ba
+     * anythink_sdk loadBannerAd      placementID=b693bea9112a25 / b693937619055f
+     * anythink_sdk loadInterstitialAd placementID=b687e0e80aa637 / b693937657d34f
+     * anythink_sdk loadRewardedVideo  placementID=b6a2a1cea7a00b
+     * </pre>
+     *
+     * <p>此前 {@code sdk-init} 拦的是 {@code ATSDK.init}，但 Dart 侧的加载请求走的是
+     * Flutter 插件这条独立路径，不经过那些静态入口，所以照样发得出去。</p>
+     *
+     * <p>hook 点<b>不能</b>选 {@code AnythinkSdkPlugin.onMethodCall}——实测该类没有这个方法
+     * （{@code NoSuchMethodException params=2}）。这个插件把通道处理器注册为
+     * lambda 或内部类，方法名不稳定。</p>
+     *
+     * <p>改为拦 {@code MsgUtil} 之外的公共入口不可行，最终选<b>按方法名前缀过滤
+     * {@code MethodCall} 构造函数</b>：{@link #installNativeBridgeFilter} 已经在这里，
+     * 通道名与方法名都能拿到，识别出广告加载调用后<b>把方法名改掉</b>，
+     * 让插件的分发逻辑落到「未知方法」分支，自然回 {@code notImplemented}。</p>
+     *
+     * <p>为什么改方法名而不是清空参数：参数结构 Dart 侧不检查，清空未必阻止加载；
+     * 而方法名不匹配一定走不到加载逻辑。{@code notImplemented} 对 Dart 是个明确的
+     * 「这个功能不存在」，比无限等待安全。</p>
+     */
+    private void installAnyThinkBridgeBlock(Context ctx) {
+        ctx.feature(FEAT_AT_BRIDGE, () -> {
+            Class<?> callCls = Reflect.findClass(ctx.classLoader(),
+                    "io.flutter.plugin.common.MethodCall");
+            if (callCls == null) {
+                throw new ClassNotFoundException("io.flutter.plugin.common.MethodCall");
+            }
+            java.lang.reflect.Constructor<?> ctor =
+                    Reflect.ctor(callCls, String.class, Object.class);
+            java.lang.reflect.Field methodField = Reflect.field(callCls, "method");
+
+            ctx.hooks.interceptCtor(FEAT_AT_BRIDGE, ctor, chain -> {
+                Object created = chain.proceed();
+                try {
+                    Object name = chain.getArg(0);
+                    if (name instanceof String && isAdLoadCall((String) name)) {
+                        Object target = chain.getThisObject();
+                        if (target != null) {
+                            // method 是 final，但反射可写；构造刚结束、还没人读过它
+                            methodField.set(target, "litiansuoBlocked_" + name);
+                            ctx.log.hit("anythink " + name + " -> blocked");
+                        }
+                    }
+                } catch (Throwable t) {
+                    ctx.log.error("anythink bridge block failed", t);
+                }
+                return created;
+            });
+        });
+    }
+
+    /**
+     * 判断一个通道方法名是否会真正拉取或展示广告。
+     *
+     * <p>按前缀判断而不是枚举：placement 类型会随版本增加
+     * （{@code loadNativeAd} / {@code loadBannerAd} / {@code loadInterstitialAd}
+     * / {@code loadRewardedVideo}...），枚举必然滞后。</p>
+     *
+     * <p>{@code Ad} / {@code Video} 后缀是必要的限定：光看 {@code load} 前缀会误伤
+     * 应用自家桥上的 {@code loadXxx} 之类正常方法。</p>
+     */
+    private static boolean isAdLoadCall(String name) {
+        boolean isLoad = name.startsWith("load") || name.startsWith("preload")
+                || name.startsWith("showAd") || name.startsWith("show");
+        if (!isLoad) {
+            return false;
+        }
+        return name.endsWith("Ad") || name.endsWith("Video") || name.contains("Ad");
     }
 
     /**
@@ -442,6 +521,27 @@ final class Pan123Rules implements RuleSet {
             Method getString = Reflect.method(prefsCls, "getString", String.class, String.class);
             Method getInt = Reflect.method(prefsCls, "getInt", String.class, int.class);
             Method getBoolean = Reflect.method(prefsCls, "getBoolean", String.class, boolean.class);
+            Method getAll = Reflect.method(prefsCls, "getAll");
+
+            // 键名测绘：Dart 侧的 shared_preferences 全部落在这里（键名带 flutter. 前缀），
+            // 浮标之类「可手动关闭」的组件必然存了关闭状态，先看清有哪些键才能定点覆盖。
+            final java.util.concurrent.atomic.AtomicBoolean dumped =
+                    new java.util.concurrent.atomic.AtomicBoolean();
+            ctx.hooks.intercept(FEAT_VIP + "-keys", getAll, chain -> {
+                Object all = chain.proceed();
+                if (all instanceof Map && !((Map<?, ?>) all).isEmpty()
+                        && dumped.compareAndSet(false, true)) {
+                    StringBuilder sb = new StringBuilder();
+                    for (Object k : ((Map<?, ?>) all).keySet()) {
+                        if (sb.length() > 0) {
+                            sb.append(" | ");
+                        }
+                        sb.append(k);
+                    }
+                    ctx.log.info("prefs keys: " + sb);
+                }
+                return all;
+            });
 
             ctx.hooks.intercept(FEAT_VIP, getString, chain -> {
                 if (!VIP_KEY.equals(chain.getArg(0))) {
@@ -532,6 +632,20 @@ final class Pan123Rules implements RuleSet {
             }
             String k = (String) e.getKey();
             Object v = e.getValue();
+            if (AD_TIME_KEYS.contains(k)) {
+                // 时长类：顶满而非置 0。置 0 等于权益已过期，是反效果。
+                if (v instanceof Integer) {
+                    e.setValue((int) AD_FREE_TIME);
+                    changed++;
+                } else if (v instanceof Long) {
+                    e.setValue(AD_FREE_TIME);
+                    changed++;
+                } else if (v instanceof String) {
+                    e.setValue(String.valueOf(AD_FREE_TIME));
+                    changed++;
+                }
+                continue;
+            }
             if (AD_OFF_KEYS.contains(k)) {
                 // 类型必须与原值一致：Dart 侧按声明类型解码，int 换成 bool 会直接抛异常
                 if (v instanceof Boolean && (Boolean) v) {
@@ -720,8 +834,9 @@ final class Pan123Rules implements RuleSet {
      * <p>{@code isInitAd} 置 0 是从源头关掉广告 SDK 初始化，与 {@code sdk-init} 的方法级掐断
      * 互为兜底：前者让应用自己不去初始化，后者防止它绕过开关。</p>
      *
-     * <p><b>不动 {@code remove_ads_effect}</b>：字面看是「免广告已生效」，含义未确认，
-     * 乱改可能让应用以为用户已购买而进入异常分支。只关入口，不伪造权益状态。</p>
+     * <p><b>{@code remove_ads_effect} 保持 1 不动</b>：它是免广告功能的开关，
+     * 与 {@code RemoveAdsTime}（剩余时长）成对使用。此前把它置 0 是判断错误——
+     * 关掉开关会让时长根本不被检查，正确做法是保持开关为 1、把时长顶满。</p>
      *
      * <p><b>已验证的效果</b>：{@code button_*} 全置 0 后，传输页三屏的会员横幅从 3 条降到 1 条
      * （下载页与离线下载页的消失，上传页的仍在）。这证明这批字段确实驱动那些位置。</p>
@@ -743,15 +858,36 @@ final class Pan123Rules implements RuleSet {
             {"\"button_user_center\":1", "\"button_user_center\":0"},
             {"\"button_quit\":1", "\"button_quit\":0"},
             {"\"button_splash_screen\":1", "\"button_splash_screen\":0"},
-            // 「免广告」入口开放标记。此前不敢动，怕被当成伪造已购买状态；
-            // 但通道测绘显示 Dart 侧把它与 button_* 一起塞进 storageAdFreeData，
-            // 说明它与 button_* 同类，只控制入口是否展示，不代表实际权益。
-            {"\"remove_ads_effect\":1", "\"remove_ads_effect\":0"},
-            // 剩余一条横幅的候选开关：连续包月与会员商品 id
+            // 免广告权益：把剩余时长改成很大的值，等于「已领取且远未到期」。
+            //
+            // 这两个字段是一对：remove_ads_effect 是功能开关，RemoveAdsTime 是剩余时长。
+            // 原始值 effect=1 + time=0 意思是「功能可用但没有时长」——也就是
+            // 应用弹的「连续看 3 个广告可获得 24 小时免广告权益」要发的那个奖。
+            //
+            // 所以 effect 必须保持 1（此前把它置 0 是判断错误：关掉开关会让时长根本不被检查），
+            // 只把时长顶满。取 2e9 而不是更大：若该字段是 int，超过 2^31-1 会溢出；
+            // 2e9 作为时间戳约合 2033 年，作为秒数约合 63 年，两种语义都够用。
+            {"\"RemoveAdsTime\":0", "\"RemoveAdsTime\":2000000000"},
+            // 会员购买入口。实测对 Flutter 侧那两处无效，但语义明确、置 0 无副作用，
+            // 保留以覆盖走原生渲染的其它入口。
             {"\"continuousPay\":1", "\"continuousPay\":0"},
             {"\"loadVipBuyId\":154", "\"loadVipBuyId\":0"},
             {"\"loadBuyEntryMode\":2", "\"loadBuyEntryMode\":0"},
     };
+
+    /**
+     * 桥参数里表示「免广告剩余时长」的键，改成很大的值而非 0。
+     *
+     * <p>与 {@link #AD_OFF_KEYS} 相反：那些是开关，置 0 表示关闭；
+     * 这些是时长，必须顶满才表示「权益还在有效期内」。置 0 反而等于权益已过期。</p>
+     */
+    private static final Set<String> AD_TIME_KEYS = new HashSet<>(java.util.Arrays.asList(
+            "removeAdsTime",
+            "RemoveAdsTime"
+    ));
+
+    /** 免广告剩余时长的伪造值，取值理由见 {@link #CONFIG_PATCHES}。 */
+    private static final long AD_FREE_TIME = 2000000000L;
 
     /**
      * 把指定接口的响应体原样打进日志，用于确定 JSON 结构。
