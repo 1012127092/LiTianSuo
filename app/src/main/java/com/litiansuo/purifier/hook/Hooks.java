@@ -12,7 +12,9 @@ import io.github.libxposed.api.XposedInterface;
  * <ul>
  *   <li>统一设 {@code ExceptionMode.PROTECTIVE}：hook 回调内部抛异常时框架只记日志、
  *       调用照原样继续，不会把目标应用带崩；</li>
- *   <li>统一设 {@code id}：便于日志定位，也让同 id 重复注册变成原子替换而非叠加；</li>
+ *   <li>统一设 {@code id}：便于日志定位。<b>注意 id 不去重</b>——同 id 重复注册是
+ *       叠加而非替换（实测钩子数 8→42→76→110 逐轮递增），所以必须由调用方保证
+ *       每个 hook 只注册一次，不能指望 id 兜底；</li>
  *   <li>统一记录 {@link io.github.libxposed.api.XposedInterface.HookHandle}，
  *       {@link #unhookAll()} 可一次性摘掉全部 hook。</li>
  * </ul>
