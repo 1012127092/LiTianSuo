@@ -24,6 +24,9 @@ public final class AdaptedApps {
     /** 123 云盘。 */
     public static final String PKG_PAN123 = "com.mfcloudcalculate.networkdisk";
 
+    /** QQ 音乐。 */
+    public static final String PKG_QQMUSIC = "com.tencent.qqmusic";
+
     /** 一个已适配应用的元信息。 */
     public static final class Entry {
         /** 目标应用包名。 */
@@ -45,6 +48,7 @@ public final class AdaptedApps {
     static {
         LinkedHashMap<String, Entry> m = new LinkedHashMap<>();
         m.put(PKG_PAN123, new Entry(PKG_PAN123, "123 云盘", "3.2.17"));
+        m.put(PKG_QQMUSIC, new Entry(PKG_QQMUSIC, "QQ 音乐", "20.7.5.8"));
         ENTRIES = Collections.unmodifiableMap(m);
     }
 

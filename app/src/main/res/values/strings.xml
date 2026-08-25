@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">李田所</string>
-    <string name="module_description">综合去广告模块：自适应拦截广告 SDK 初始化与广告请求，可在模块内按应用单独启用。</string>
+    <string name="module_description">从者，Assassin，田所浩二。24岁，是学生</string>
 
     <string name="status_title">模块状态</string>
     <string name="status_active">已激活</string>

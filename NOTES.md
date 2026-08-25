@@ -447,22 +447,181 @@ Java 能碰到的任何配置。
 两家都是方法名不对，需要用真机反射把实际方法列表打出来再修。它们的 View 层
 已被 `wm_*` 资源名规则覆盖，优先级不高。
 
-## 待办
+---
+
+# QQ 音乐（com.tencent.qqmusic）
+
+适配版本 `20.7.5.8`（versionCode 7308），规则在 `rules/QqMusicRules.java`。
+
+## 与 123 云盘处境完全相反
+
+| 维度 | 123 云盘 | QQ 音乐 |
+|---|---|---|
+| 加固 | 爱加密整体加固，业务 dex 在 `assets/ijiami.dat` | **无加固**，25 个 dex 全明文（7.8–11.3 MB 各） |
+| UI | Flutter（`libapp.so` + Skia 自绘） | 原生 View + Hippy（`libhippy.so` 15 MB） |
+| 可静态分析 | 只能拿到壳 `s.h.e.l.l.*` | jadx 可直接读业务码 |
+| `addView` 隐藏 | 对主界面**完全无效** | **有效**，广告控件都是真 View |
+
+已确认无 `ijiami|libshell|libDexHelper|libjiagu|legu|libtprt|libmix` 任何特征，
+`Application` 是明文的 `com.tencent.qqmusic.MusicApplication`。所以这个应用的
+hook 点全部是**读过反编译源码后选的决策点**，不是靠真机探针猜的。
+
+## 三家广告体系并存，类名全部未混淆
+
+按类数量（11,647 个广告相关类）：
+
+| 包 | 类数 | 身份 |
+|---|---|---|
+| `com/qq/e/comm` + `com/qq/e/tg` | 2511 | 广点通（优量汇）|
+| `com/tencent/ams/fusion` | 1072 | 腾讯 AMS 竞价引擎 |
+| `com/tencent/ams/mosaic` | 760 | AMS 动态模板 |
+| `com/tencent/ams/dsdk` | 377 | AMS 引擎 |
+| `com/tencentmusic/ad/*` | 1139 | TME 自家广告 SDK |
+| `com/tencent/qqmusic/business/ad/*` | 2788 | 应用自家广告业务 |
+
+**不存在**穿山甲、快手、AnyThink —— 与 123 云盘那种十几家聚合完全不同。
+
+自家业务包把广告位置直接写进了包名，这是最有价值的发现：
+
+```
+ad/freemode 719   ad/recommend 551  ad/player 353   ad/splash 280
+ad/reward 104     ad/topbarad 98    ad/media 91     ad/vipearningmode 63
+ad/pauseEgg 19    ad/interstitial 7
+```
+
+## 最值钱的 hook：`PlayerAdControl` 的展示总闸
+
+反编译 `com.tencent.qqmusic.business.ad.player.PlayerAdControl` 看到：
+
+```java
+public final boolean e(SongInfo song, AdType adType) {
+    ...
+    Log.h("EasterEggPlayerAdControl", "show ad new logic");
+    return true;                      // 无条件放行
+}
+```
+
+`AdType` 只有 `playerAD` 与 `easterEggAD` 两个枚举值，正好是「播放页广告」与
+「暂停彩蛋」。这一个方法就是两者共用的总闸，恒返回 `false` 等于两个广告位一起关。
+
+**方法名 `e` 没有硬编码**：按签名特征定位（返回 `boolean`、两参、第二参是枚举），
+该组合在这个类里唯一，混淆改名不影响。特征不唯一时返回 null 让整项降级，不赌。
+
+## 刻意不拦的部分
+
+`KEEP_PREFIXES` 显式豁免这些子包，它们是「用户主动点了才出现、看广告换权益」：
+
+- `ad/freemode`、`ad/radarfreemode` —— 免费听模式
+- `ad/reward` —— 激励视频
+- `ad/vipearningmode` —— 会员赚取模式
+- `topbarad/freemode` —— 免费听入口条
+- `ad/debug` —— 广告调试面板
+
+同理 **`TMEAds.init` 不掐**：上面三个功能都走它，掐了会一起坏。广点通与
+`TangramAdManager` 才是纯外部联盟，与权益无关，可以从初始化就断。
+
+豁免必须写成显式清单：广告业务包有 20 多个子包，列「不拦哪些」比列「拦哪些」
+短得多，也不会因为应用新增广告位而漏掉。判定时**豁免优先**——`freemode` 同时
+也匹配 `business.ad` 前缀，顺序反了就会误杀。
+
+## 拦 Activity 必须用精确全名，不能用前缀
+
+开屏页 `com.tencent.qqmusic.activity.DynamicSplashActivity` 与应用主界面
+`AppStarterActivity` 同在 `activity` 包下，用前缀会把整个应用拦死。
+
+清单里的 5 个页面：`DynamicSplashActivity`（冷启开屏，是个 `WebViewActivity`
+子类，靠 `auto_close_time` / `show_skip_btn` extra 驱动）、
+`HotLaunchSplashActivity` 与 `HotLaunchLargeScreenSplashActivity`（热启开屏）、
+`GDTLandingPageWebViewActivity`、`com.tencent.tads.splash.AdLandingPageActivity`。
+
+## 插屏：hook `DialogFragment.show` 而不是业务触发点
+
+插屏走 `business.ad.interstitial.InterstitialAdDialogFragment`。选框架类的
+`show` 是因为签名稳定、且是所有弹出路径的必经处。
+
+两个坑：
+1. **必须按 `getThisObject()` 的类名过滤**。登录、分享、确认框都走同一个方法，
+   不过滤会把应用所有弹窗干掉。
+2. `show` 有 void 与 int 两种返回类型（`show(FragmentTransaction,String)` 返回
+   事务 id）。返回类型不匹配会当场抛 `ClassCastException`，所以按返回类型分别
+   给 `null` 与 `-1`。
+
+## 真机验证结果（首轮就通过）
+
+```
+features OK(6): ad-activity, ad-view, player-ad, interstitial-ad,
+                gdt-init/GDTADManager, gdt-init/TangramAdManager
+E（错误）计数 0
+player ad gate hooked: e(SongInfo, AdType)     ← 签名定位成功
+```
+
+命中统计（浏览首页 + 播放页 + 暂停约 10 分钟）：
+
+| 命中 | 次数 |
+|---|---|
+| `GDTADManager#initWith -> blocked` | 1950 |
+| `TangramAdManager#init -> blocked` | 632 |
+| `hid ad view: TMENativeAdContainer` | 15 |
+| `player ad gate -> false (e)` | 11 |
+| `hid ad view:` 其余 TME 控件（MediaView / VideoView / AdPlayedTimeView …） | 各 2–7 |
+| `hid ad view: business.ad.search.banner.BannerAdTopCropImageView` | 2 |
+
+开屏无广告直接进主界面，播放页、暂停、首页均无广告位，应用功能正常。
+
+## 待查：广点通的重试风暴
+
+`initWith` 被拦到 1950 次，来源线程 `AMS-SDKInit0-thread-1`（1776 次）。
+反编译 `GDTADManager.initWith` 确认它靠实例字段 `f368a` 做「已初始化」短路：
+我们让它返回 `false` 而没有置那个字段，所以 AMS 侧无限重试。
+
+现象上没坏（CPU 30% 属播放态正常，`E` 计数 0），但白耗电，而且日志 10 分钟就
+308 KB。两条候选修法，下次择一验证：
+
+1. 让 `initWith` 返回 `true` 并反射把 `f368a` 置 `Boolean.TRUE`，骗它「已初始化」，
+   同时改拦更下游的 `TGSplashAD` / `TangramAdLoader` 的加载方法；
+2. 在拦截器里用 `AtomicBoolean` 只放行一次日志，重试照拦但不记 —— 治日志不治耗电。
+
+倾向第 1 条：它同时解决耗电与日志。已反编译好待读的类在
+`临时/qqm-src/`：`TangramAdLoader.java`、`TMENativeAD.java`、`TGSplashAD.java`。
+
+## QQ 音乐待办
+
+1. 收掉广点通重试风暴（见上，倾向伪造 `f368a` 已初始化）
+2. 体验后决定是否再拦 `ad/recommend`（551 类，首页推荐位）与 `ad/naming`（冠名）
+3. `ad/media` 91 类未看，可能是音频贴片广告
+
+## 通用待办
 
 1. 修 `WindAds` / `QyClient` 的方法名（真机反射打出实际方法列表）
 2. `FileLog` 收进 verbose 开关，别无条件写 `/sdcard`
 3. 把 `ServiceBridge.scope()` 显示到 `MainActivity`
+4. `Hooks` 用 id→handle 映射解决同 id 重复注册叠加的问题
 
 ## 真机验证流程
 
+把 `<pkg>` 换成目标包名（`com.mfcloudcalculate.networkdisk` 或
+`com.tencent.qqmusic`）：
+
 ```
 adb install -r app/build/outputs/apk/release/app-release.apk
-adb shell rm -f /sdcard/Android/data/com.mfcloudcalculate.networkdisk/files/litiansuo-diag.log
-adb shell am force-stop com.mfcloudcalculate.networkdisk
-adb shell monkey -p com.mfcloudcalculate.networkdisk -c android.intent.category.LAUNCHER 1
-# 等 20 秒
-adb shell cat /sdcard/Android/data/com.mfcloudcalculate.networkdisk/files/litiansuo-diag.log
+adb shell rm -f /sdcard/Android/data/<pkg>/files/litiansuo-diag.log
+adb shell am force-stop <pkg>
+adb shell monkey -p <pkg> -c android.intent.category.LAUNCHER 1
+# 等 25 秒（QQ 音乐启动比 123 云盘慢）
+adb shell grep -cE '\] E ' /sdcard/Android/data/<pkg>/files/litiansuo-diag.log
+adb shell "grep -E '\] H ' <log> | sed 's/.*\] H //' | sort | uniq -c | sort -rn"
 ```
+
+新增一个适配应用要同步改**四**处，少一处就静默不生效：
+
+1. `core/AdaptedApps.java` 加常量 + `ENTRIES` 一条
+2. `rules/AppRules.java` 加分支
+3. `resources/META-INF/xposed/scope.list` 加包名（LSPosed 只注入这里声明的应用）
+4. `AndroidManifest.xml` 的 `<queries>` 加一行（否则模块 App 查不到是否安装）
+
+改完还要在 **LSPosed 管理器里手动勾选**新应用的作用域 —— `staticScope=true` 只是
+把候选列表限定为 `scope.list`，不代表自动启用。第一轮 QQ 音乐日志文件压根没生成
+就是这个原因，别误判成代码问题。
 
 改任何代码后都必须 `force-stop`，否则旧进程里的 hook 不会更新。
 

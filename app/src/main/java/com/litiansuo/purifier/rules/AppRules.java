@@ -19,6 +19,9 @@ public final class AppRules {
         if (AdaptedApps.PKG_PAN123.equals(packageName)) {
             return new Pan123Rules();
         }
+        if (AdaptedApps.PKG_QQMUSIC.equals(packageName)) {
+            return new QqMusicRules();
+        }
         return null;
     }
 }
