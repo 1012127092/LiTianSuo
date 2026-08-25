@@ -64,6 +64,16 @@ final class Pan123Rules implements RuleSet {
     private static final String FEAT_FLUTTER = "flutter-probe";
     /** 原生桥过滤：在应用自家 Flutter 桥上改掉去广告开关。 */
     private static final String FEAT_BRIDGE = "native-bridge";
+    /**
+     * 本地会员标记伪造：让 Dart 侧以为已开通会员，从而不展示「非会员才显示」的推广位。
+     *
+     * <p><b>本模块唯一伪造状态的功能，故单独成项</b>，用户可在模块界面单独关掉。
+     * 其余规则都只是「不显示广告」，这一项改变了应用对自身状态的认知。</p>
+     */
+    private static final String FEAT_VIP = "fake-vip";
+
+    /** 本地会员标记的键名，写入与读取两侧共用。 */
+    private static final String VIP_KEY = "isVip";
 
     /**
      * 桥调用参数里代表「显示广告/会员入口」的键名，一律改成关闭。
@@ -399,8 +409,62 @@ final class Pan123Rules implements RuleSet {
         installBodyProbe(ctx);
         installFlutterChannelProbe(ctx);
         installNativeBridgeFilter(ctx);
+        installVipFlagOverride(ctx);
         installAdApiFilter(ctx);
         installSdkInitBlock(ctx);
+    }
+
+    /**
+     * 在读取侧覆盖本地会员标记。
+     *
+     * <p>为什么必须改读取侧：{@link #patchKeyValueLists} 已把写入的 {@code isVip} 改成 1
+     * （日志确认 {@code bridge isVip 0 -> 1}），但横幅依旧存在。原因是 Dart 侧通过
+     * {@code obtainSharedPreferences} <b>取</b>值，而回复方向的数据是按下标定位的数组，
+     * 没有键名可匹配，在通道层改不了。</p>
+     *
+     * <p>绕过通道，直接改数据的真正来源：桥最终读的是 Android {@code SharedPreferences}。
+     * 在 {@code SharedPreferencesImpl} 上拦一层，无论谁问 {@code isVip}、
+     * 走哪条路径，答案都一致。这也顺带覆盖了原生侧自己读这个值的地方。</p>
+     *
+     * <p>类型必须原样返回：桥存的是字符串，Dart 也按字符串解，返回数字会解码失败。
+     * 所以三个 getter 各自返回对应类型。</p>
+     *
+     * <p>热点考虑：{@code SharedPreferences} 读取很频繁，所以回调里<b>第一步就是键名比较</b>，
+     * 不匹配立刻 {@code proceed()}，不做任何额外工作。</p>
+     */
+    private void installVipFlagOverride(Context ctx) {
+        ctx.feature(FEAT_VIP, () -> {
+            Class<?> prefsCls = Reflect.findClass(ctx.classLoader(),
+                    "android.app.SharedPreferencesImpl");
+            if (prefsCls == null) {
+                throw new ClassNotFoundException("android.app.SharedPreferencesImpl");
+            }
+            Method getString = Reflect.method(prefsCls, "getString", String.class, String.class);
+            Method getInt = Reflect.method(prefsCls, "getInt", String.class, int.class);
+            Method getBoolean = Reflect.method(prefsCls, "getBoolean", String.class, boolean.class);
+
+            ctx.hooks.intercept(FEAT_VIP, getString, chain -> {
+                if (!VIP_KEY.equals(chain.getArg(0))) {
+                    return chain.proceed();
+                }
+                ctx.log.hit("prefs isVip -> \"1\"");
+                return "1";
+            });
+            ctx.hooks.intercept(FEAT_VIP, getInt, chain -> {
+                if (!VIP_KEY.equals(chain.getArg(0))) {
+                    return chain.proceed();
+                }
+                ctx.log.hit("prefs isVip -> 1");
+                return 1;
+            });
+            ctx.hooks.intercept(FEAT_VIP, getBoolean, chain -> {
+                if (!VIP_KEY.equals(chain.getArg(0))) {
+                    return chain.proceed();
+                }
+                ctx.log.hit("prefs isVip -> true");
+                return Boolean.TRUE;
+            });
+        });
     }
 
     /**
@@ -481,6 +545,54 @@ final class Pan123Rules implements RuleSet {
         }
         if (changed > 0) {
             ctx.log.hit("bridge args patched: " + changed + " key(s)");
+        }
+        patchKeyValueLists(ctx, m);
+    }
+
+    /**
+     * 处理 {@code keyList} / {@code valueList} 双数组形式的共享参数写入。
+     *
+     * <p>实测 {@code storageSharedPreferences} 的参数长这样：</p>
+     * <pre>
+     * {"keyList":["isVip","isAgreeAgreement"], "valueList":["0","1"]}
+     * </pre>
+     *
+     * <p>键与值分在两个数组里按下标对应，所以不能靠 {@link #AD_OFF_KEYS} 那种按键名
+     * 直接取值的方式处理，得先在 keyList 里定位下标。</p>
+     *
+     * <p><b>为什么要改 {@code isVip}</b>：传输页上传屏的「VIP 连续包月 ¥6.00」横幅与
+     * 右下角「免广告」浮标，在广告接口清空、配置开关全关、桥参数全改之后依然存在。
+     * 通道测绘显示 Dart 侧唯一还会读的相关状态就是 {@code isVip}，那两处必然是
+     * 「非会员才展示的推广位」。</p>
+     *
+     * <p><b>这是本模块唯一伪造状态的地方，必须单独成一项</b>（{@link #FEAT_VIP}），
+     * 用户可在模块界面单独关掉。副作用是本地会以为已开通会员，
+     * 服务端仍按真实状态返回，涉及配额的操作该失败还是会失败。</p>
+     */
+    private static void patchKeyValueLists(Context ctx, Map<Object, Object> m) {
+        if (!ctx.config.isFeatureEnabled(FEAT_VIP)) {
+            return;
+        }
+        Object keys = m.get("keyList");
+        Object values = m.get("valueList");
+        if (!(keys instanceof java.util.List) || !(values instanceof java.util.List)) {
+            return;
+        }
+        java.util.List<?> kl = (java.util.List<?>) keys;
+        @SuppressWarnings("unchecked")
+        java.util.List<Object> vl = (java.util.List<Object>) values;
+        for (int i = 0; i < kl.size() && i < vl.size(); i++) {
+            if (!"isVip".equals(kl.get(i))) {
+                continue;
+            }
+            Object old = vl.get(i);
+            // 保持原类型：Dart 按声明类型解码，字符串换成数字会直接抛异常
+            Object now = old instanceof Boolean ? Boolean.TRUE
+                    : old instanceof Integer ? (Object) 1 : "1";
+            if (!now.equals(old)) {
+                vl.set(i, now);
+                ctx.log.hit("bridge isVip " + old + " -> " + now);
+            }
         }
     }
 
