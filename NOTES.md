@@ -555,40 +555,75 @@ E（错误）计数 0
 player ad gate hooked: e(SongInfo, AdType)     ← 签名定位成功
 ```
 
-命中统计（浏览首页 + 播放页 + 暂停约 10 分钟）：
+命中统计（节流生效后，浏览首页 → 我的 → 关于 → 播放页，约 6 分钟）：
 
-| 命中 | 次数 |
+| 命中 | 说明 |
 |---|---|
-| `GDTADManager#initWith -> blocked` | 1950 |
-| `TangramAdManager#init -> blocked` | 632 |
-| `hid ad view: TMENativeAdContainer` | 15 |
-| `player ad gate -> false (e)` | 11 |
-| `hid ad view:` 其余 TME 控件（MediaView / VideoView / AdPlayedTimeView …） | 各 2–7 |
-| `hid ad view: business.ad.search.banner.BannerAdTopCropImageView` | 2 |
+| `GDTADManager#initWith -> blocked` | 记到 `(x100)`，实际远多于此，SDK 在重试 |
+| `TangramAdManager#init -> blocked` | 同上 |
+| `hid ad view: TMENativeAdContainer` | 记到 `(x10)` |
+| `hid ad view:` 其余 7 类 TME 控件 | 各 1 行（TrackExposureEmptyView / AdPlayedTimeView / VideoCoverImageView / VideoView / ExpressMediaControllerView / MediaView） |
+| `hid ad view: business.ad.search.banner.BannerAdTopCropImageView` | 1 行 |
+| `player ad gate -> false (e)` | 2 次 |
 
-开屏无广告直接进主界面，播放页、暂停、首页均无广告位，应用功能正常。
+整份日志 33 行 / 3.0 KB，`E` 计数 0。开屏无广告直接进主界面，
+首页、我的、关于、播放页均无广告位，播放正常，应用功能完好。
 
-## 待查：广点通的重试风暴
+**反编译产物已归档到 `逆向/QQ音乐/`**（跟 123 云盘同规矩）：
+`dex/`（25 个 dex）、`jadx_output/sources/`（11 个反编译类）、`ad-classes.txt`。
 
-`initWith` 被拦到 1950 次，来源线程 `AMS-SDKInit0-thread-1`（1776 次）。
-反编译 `GDTADManager.initWith` 确认它靠实例字段 `f368a` 做「已初始化」短路：
-我们让它返回 `false` 而没有置那个字段，所以 AMS 侧无限重试。
+## 广点通重试风暴：定性清楚了，但故意不修
 
-现象上没坏（CPU 30% 属播放态正常，`E` 计数 0），但白耗电，而且日志 10 分钟就
-308 KB。两条候选修法，下次择一验证：
+首轮 `initWith` 被拦 1950 次、`TangramAdManager#init` 632 次，日志 10 分钟 308 KB。
 
-1. 让 `initWith` 返回 `true` 并反射把 `f368a` 置 `Boolean.TRUE`，骗它「已初始化」，
-   同时改拦更下游的 `TGSplashAD` / `TangramAdLoader` 的加载方法；
-2. 在拦截器里用 `AtomicBoolean` 只放行一次日志，重试照拦但不记 —— 治日志不治耗电。
+反编译 `GDTADManager.initWith` 看到原因：它靠实例字段 `Boolean f368a` 做
+「已初始化」短路（`if (f368a) return true`），我们返回 `false` 时没有置那个字段，
+所以调用方每次都认为初始化失败、下次继续重试。
 
-倾向第 1 条：它同时解决耗电与日志。已反编译好待读的类在
-`临时/qqm-src/`：`TangramAdLoader.java`、`TMENativeAD.java`、`TGSplashAD.java`。
+**曾经打算反射把 `f368a` 置 `TRUE` 骗它已初始化，看完源码后放弃了。**
+`initWith` 成功路径要建立 `APPStatus` / `DeviceStatus` / `SM` / `PM` 四个字段，
+而 `TangramAdManager.init`、`TGSplashMaterialUtil.checkPreloadSplashMaterial`、
+`getExposureChecker` 全都紧接着调 `GDTADManager.getInstance().getPM().getPOFactory()`。
+只置标志位而不建那些对象，等于让 SDK 在自认就绪的状态下裸奔 —— 下一次调用就是 NPE。
+
+让广告 SDK 反复重试是浪费；让它在半初始化状态下运行是**把目标应用推向崩溃**。
+两者不是一个量级，所以选择留着重试。
+
+真机验证也支持这个判断：返回 `false` 走的是 SDK 自己就有的失败分支，
+`TangramAdManager.init` 收到 false 后只是 `onError(1)` + 打日志，不会异常。
+
+### 改成只治日志：`hitThrottled`
+
+`XLog.hitThrottled(key, msg)` 按 **10 的量级** 记（第 1、10、100、1000… 次），
+并在行尾带累计次数 `(x100)`。日志长度对命中次数取对数：拦 3 次和拦 3 万次都只有
+几行，但量级差异一眼可辨。第一次必写 —— 静默成功比可见失败更危险。
+
+`ad-view` 也换成节流（按控件类名分 key），滑列表时同一个容器会反复出现。
+
+配套加了 `XLog.callerSummary(n)`，只在**首次命中**时取一次调用栈定性重试来源。
+取栈要遍历调用链并分配字符串，放在高频拦截点上会明显拖慢目标应用，
+所以调用方必须自己保证只取一次（用 `hitThrottled` 的返回值判 `== 1`）。
+
+实测结果：**同样的浏览流程，日志从 308 KB 降到 3.0 KB、33 行**，`E` 计数仍为 0。
+
+首次命中打出的调用栈也确认了重试来源在 TME 侧而不是广点通自己：
+
+```
+TangramAdManager#init caller: ... <- android.app.NurleemFlisth#init
+                               <- com.tencentmusic.ad.c1.a#c <- com.tencentmusic.ad.c1.c#invoke
+```
+
+`NurleemFlisth` 是 LSPosed 生成的 hook 桥类名（每次开机随机），
+`com.tencentmusic.ad.c1.*` 才是真正的调用方 —— TME 的 SDK 初始化编排器在重试。
+线程名 `TMEAds-init-async-tasks` → `TMEAds-AD-REQ#N` → `AMS-SDKInit0-thread-N`
+也印证了这条链。
 
 ## QQ 音乐待办
 
-1. 收掉广点通重试风暴（见上，倾向伪造 `f368a` 已初始化）
-2. 体验后决定是否再拦 `ad/recommend`（551 类，首页推荐位）与 `ad/naming`（冠名）
-3. `ad/media` 91 类未看，可能是音频贴片广告
+1. 体验后决定是否再拦 `ad/recommend`（551 类，首页推荐位）与 `ad/naming`（冠名）
+2. `ad/media` 91 类未看，可能是音频贴片广告
+3. `topbarad` 至今一次都没命中过 —— 那个位置本来就没弹，不是规则漏了，
+   等真见到横幅再补规则，别凭空加
 
 ## 通用待办
 

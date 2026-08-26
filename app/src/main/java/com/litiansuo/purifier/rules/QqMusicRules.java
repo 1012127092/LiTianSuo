@@ -9,6 +9,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 import com.litiansuo.purifier.hook.Reflect;
+import com.litiansuo.purifier.hook.XLog;
 
 /**
  * QQ 音乐（com.tencent.qqmusic）去广告规则。
@@ -272,7 +273,7 @@ final class QqMusicRules implements RuleSet {
                     }
                     if (isAd) {
                         v.setVisibility(View.GONE);
-                        ctx.log.hit("hid ad view: " + c.getName());
+                        ctx.log.hitThrottled("view:" + c.getName(), "hid ad view: " + c.getName());
                     }
                 }
                 return chain.proceed();
@@ -409,6 +410,21 @@ final class QqMusicRules implements RuleSet {
      * 激励视频与会员赚取模式，掐了会一起坏。广点通是纯外部广告联盟，与权益无关。</p>
      *
      * <p>每家单独成一项（{@code gdt-init/<名字>}），一家的签名变了不影响另一家。</p>
+     *
+     * <h3>为什么这里必须用节流日志</h3>
+     *
+     * <p>首轮实测 {@code initWith} 十分钟被拦 <b>1950 次</b>，日志涨到 308 KB。
+     * 原因在反编译源码里很清楚：{@code initWith} 靠实例字段（{@code Boolean f368a}）
+     * 判断「已初始化」并直接返回 true，而我们返回 false 时并没有置那个字段，
+     * 所以调用方每次都认为初始化失败、下次继续重试。</p>
+     *
+     * <p><b>没有改成返回 true + 反射置那个字段</b>：那会让 SDK 在
+     * {@code PM}、{@code APPStatus}、{@code SM} 全为 null 的状态下自认已就绪，
+     * 后续任何 {@code getPM().getPOFactory()} 都会 NPE。让一个广告 SDK 反复重试是
+     * 浪费，让它在半初始化状态下运行是<b>把目标应用推向崩溃</b>，两者不是一个量级。</p>
+     *
+     * <p>所以这里只治日志：命中按 10 的量级记（第 1、10、100… 次），并在首次命中时
+     * 记一次调用栈，用来定性到底是谁在重试。栈只取一次——取栈本身不便宜。</p>
      */
     private void installGdtInitBlock(Context ctx) {
         blockInit(ctx, "com.qq.e.comm.managers.GDTADManager", "initWith");
@@ -437,8 +453,15 @@ final class QqMusicRules implements RuleSet {
                 if (fake == m) {
                     continue; // 返回类型不认识，不赌
                 }
-                ctx.hooks.intercept(featureId + "/" + m.getParameterCount(), m, chain -> {
-                    ctx.log.hit(shortName + "#" + methodName + " -> blocked");
+                final String hitKey = featureId + "/" + m.getParameterCount();
+                ctx.hooks.intercept(hitKey, m, chain -> {
+                    long times = ctx.log.hitThrottled(
+                            hitKey, shortName + "#" + methodName + " -> blocked");
+                    if (times == 1) {
+                        // 只在首次记一次调用栈：用来定性重试来源，之后不再付这个开销
+                        ctx.log.info(shortName + "#" + methodName + " caller: "
+                                + XLog.callerSummary(6));
+                    }
                     return fake;
                 });
                 n++;
