@@ -1,6 +1,23 @@
 # 李田所
 
-针对特定应用逐个适配的 Android 去广告模块（Xposed / LSPosed）。
+Android 去广告 / 净化模块（Xposed / LSPosed），针对特定应用逐个适配。
+
+## 功能
+
+- **开屏广告拦截** — 拦截启动时的全屏广告 Activity 与 Splash 容器
+- **信息流广告隐藏** — 隐藏首页/频道信息流中嵌入的广告卡片
+- **弹窗广告拦截** — 拦截第三方广告 SDK 弹窗 Activity
+- **广告 SDK 初始化拦截** — 掐断穿山甲/百度/广点通/Noah 等 SDK 的 init 入口
+- **统计上报拦截** — 拦截应用自家统计 Service 与埋点上报
+- **推送保活拦截** — 拦截推送与保活相关 Service，减少后台唤醒
+- **启动加速** — 拦截开机自启 Service 与不必要的预热组件，减少首屏渲染时间与发热
+- **底栏 tab 隐藏** — 隐藏不需要的底部导航 tab
+- **页面净化** — 隐藏「我的」页面中的运营入口（农场/游戏/直播等）
+- **弹窗引导拦截** — 隐藏"个性推荐"等引导浮层
+- **崩溃恢复禁用** — 禁用 CrashRecovery 逻辑，避免页面来回闪烁
+- **自动签到** — 后台自动完成每日签到
+- **账号切换检测** — 检测账号切换并重新适配
+- **模块面板** — 在目标应用设置页连点版本号 7 次唤出功能开关面板
 
 ## 定位
 
@@ -10,12 +27,6 @@
 
 已适配应用登记在 `AdaptedApps` 中，同时体现为 LSPosed 的作用域列表
 （`module.prop` 里 `staticScope=true`），所以模块在 LSPosed 里只显示已适配的应用。
-
-## 已适配
-
-| 应用 | 包名 | 验证版本 |
-|---|---|---|
-| 123 云盘 | `com.mfcloudcalculate.networkdisk` | 3.2.17 |
 
 ## 技术选型
 
@@ -40,7 +51,7 @@ legacy 包，因此 `XposedHelpers`、`XSharedPreferences`、`XposedBridge.log` 
 ## 结构
 
 ```
-core/AdaptedApps     已适配应用注册表（新增应用的三处同步点之一）
+core/AdaptedApps     已适配应用注册表
 core/PrefKeys        模块 App 与目标进程共享的配置键约定
 hook/PurifierModule  入口类，按包名 + 进程名过滤，主进程只初始化一次
 hook/FeatureGuard    功能隔离：单项注册失败只降级那一项，输出 OK/FAILED/DISABLED 汇总
@@ -51,7 +62,7 @@ hook/XLog            同时写 logcat 与 LSPosed 模块日志
 rules/RuleSet        规则集接口
 rules/AppRules       包名 → 规则集路由
 rules/AdSdk          广告 SDK 类名前缀清单
-rules/Pan123Rules    123 云盘规则
+rules/panel/         面板对话框与统一勾选项
 ui/MainActivity      激活状态与按应用开关
 ui/ServiceBridge     与 LSPosed 的连接、远程配置读写
 ```
@@ -69,15 +80,6 @@ ui/ServiceBridge     与 LSPosed 的连接、远程配置读写
 [<包名>] features OK(n): ...
 [<包名>] features FAILED(n): ...
 ```
-
-## 新增一个适配应用
-
-必须同步改四处，漏改会导致「界面里有但 hook 不生效」：
-
-1. `core/AdaptedApps` 加一条 `Entry`
-2. `app/src/main/resources/META-INF/xposed/scope.list` 加一行包名
-3. `app/src/main/AndroidManifest.xml` 的 `<queries>` 加一行
-4. `rules/AppRules.forPackage` 加一个分支，并实现对应 `RuleSet`
 
 ## 构建
 

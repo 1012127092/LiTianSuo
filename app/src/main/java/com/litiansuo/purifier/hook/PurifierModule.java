@@ -74,6 +74,12 @@ public final class PurifierModule extends XposedModule {
         // 只在主进程干活：广告 UI 都在主进程，子进程（:push 等）hook 了纯属浪费。
         String process = currentProcessName();
         if (!pkg.equals(process)) {
+            // UC 非必要子进程：阻止 :channel/:MediaPlayerService 的 Service 初始化
+            // （三星 Freecess 绕过 Java startService 直接调 AMS，只能在子进程侧拦）
+            if ("com.UCMobile".equals(pkg) && (process.endsWith(":channel")
+                    || process.endsWith(":MediaPlayerService"))) {
+                blockSubProcessService(process);
+            }
             return;
         }
         if (!INITIALIZED.compareAndSet(false, true)) {
@@ -380,6 +386,23 @@ public final class PurifierModule extends XposedModule {
             return app instanceof Application ? (Application) app : null;
         } catch (Throwable t) {
             return null;
+        }
+    }
+
+    /**
+     * 在 UC 非必要子进程（:channel/:MediaPlayerService）中 hook
+     * {@code ActivityThread.handleCreateService} 让它空实现——Service 不创建，
+     * 进程启动后无事可做很快被系统回收。省内存 + 省长连接心跳发热。
+     */
+    private void blockSubProcessService(String process) {
+        try {
+            Class<?> atCls = Class.forName("android.app.ActivityThread");
+            Class<?> csdCls = Class.forName("android.app.ActivityThread$CreateServiceData");
+            java.lang.reflect.Method hcs = atCls.getDeclaredMethod("handleCreateService", csdCls);
+            new Hooks(this, new XLog(this, false)).blockVoid("subproc-block/hcs", hcs);
+            android.util.Log.i(XLog.TAG, "subproc-block: hooked handleCreateService in " + process);
+        } catch (Throwable t) {
+            android.util.Log.e(XLog.TAG, "subproc-block failed in " + process, t);
         }
     }
 

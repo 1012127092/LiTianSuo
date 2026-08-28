@@ -21,4 +21,5 @@
     <string name="toast_scope_denied">授权被拒绝或失败：%1$s</string>
     <string name="toast_need_restart">配置已保存，请强制停止目标应用后重新打开生效</string>
     <string name="toast_no_service">未连接到 LSPosed 服务，请确认模块已在 LSPosed 中启用</string>
+    <string name="hint_panel_invoke">部分应用可连续点击版本号或者图标7次唤出模块菜单</string>
 </resources>

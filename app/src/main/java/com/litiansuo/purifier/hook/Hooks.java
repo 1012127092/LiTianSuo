@@ -27,6 +27,8 @@ public final class Hooks {
     private final XposedInterface xposed;
     private final XLog log;
     private final java.util.List<XposedInterface.HookHandle> handles = new java.util.ArrayList<>();
+    /** id → handle 映射：同 id 重复注册时先 unhook 旧的，避免钩子叠加。 */
+    private final java.util.Map<String, XposedInterface.HookHandle> idMap = new java.util.concurrent.ConcurrentHashMap<>();
 
     public Hooks(XposedInterface xposed, XLog log) {
         this.xposed = xposed;
@@ -61,22 +63,26 @@ public final class Hooks {
 
     /** 注册一个自定义拦截器。 */
     public XposedInterface.HookHandle intercept(String id, Method m, XposedInterface.Hooker hooker) {
+        unhookById(id);
         XposedInterface.HookHandle h = xposed.hook(m)
                 .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                 .setId(id)
                 .intercept(hooker);
         handles.add(h);
+        idMap.put(id, h);
         return h;
     }
 
     /** 注册构造函数拦截器。 */
     public XposedInterface.HookHandle interceptCtor(String id, Constructor<?> c,
                                                     XposedInterface.Hooker hooker) {
+        unhookById(id);
         XposedInterface.HookHandle h = xposed.hook(c)
                 .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                 .setId(id)
                 .intercept(hooker);
         handles.add(h);
+        idMap.put(id, h);
         return h;
     }
 
@@ -122,5 +128,18 @@ public final class Hooks {
             }
         }
         handles.clear();
+        idMap.clear();
+    }
+
+    /** 如果 id 已注册过，先摘掉旧钩子，避免同 id 叠加。 */
+    private void unhookById(String id) {
+        XposedInterface.HookHandle old = idMap.remove(id);
+        if (old != null) {
+            try {
+                old.unhook();
+            } catch (Throwable ignored) {
+            }
+            handles.remove(old);
+        }
     }
 }

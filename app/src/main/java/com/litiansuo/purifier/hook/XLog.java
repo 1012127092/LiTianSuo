@@ -36,7 +36,9 @@ public final class XLog implements FeatureGuard.Logger {
     @Override
     public void info(String msg) {
         Log.i(TAG, msg);
-        FileLog.write("I " + msg);
+        if (verbose) {
+            FileLog.write("I " + msg);
+        }
         if (xposed != null) {
             xposed.log(Log.INFO, TAG, msg);
         }
@@ -45,7 +47,9 @@ public final class XLog implements FeatureGuard.Logger {
     @Override
     public void warn(String msg) {
         Log.w(TAG, msg);
-        FileLog.write("W " + msg);
+        if (verbose) {
+            FileLog.write("W " + msg);
+        }
         if (xposed != null) {
             xposed.log(Log.WARN, TAG, msg);
         }

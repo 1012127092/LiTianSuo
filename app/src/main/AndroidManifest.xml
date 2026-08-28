@@ -8,6 +8,7 @@
     <queries>
         <package android:name="com.mfcloudcalculate.networkdisk" />
         <package android:name="com.tencent.qqmusic" />
+        <package android:name="com.UCMobile" />
     </queries>
 
     <application

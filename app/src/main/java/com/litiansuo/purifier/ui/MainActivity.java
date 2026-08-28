@@ -56,6 +56,13 @@ public final class MainActivity extends android.app.Activity implements ServiceB
         statusView.setTextSize(15f);
         root.addView(statusView);
 
+        TextView hint = new TextView(this);
+        hint.setText(R.string.hint_panel_invoke);
+        hint.setTextSize(12f);
+        hint.setTextColor(Color.GRAY);
+        hint.setPadding(0, dp(8), 0, 0);
+        root.addView(hint);
+
         TextView section = new TextView(this);
         section.setText(R.string.section_targets);
         section.setTextSize(13f);

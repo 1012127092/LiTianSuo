@@ -22,6 +22,9 @@ public final class AppRules {
         if (AdaptedApps.PKG_QQMUSIC.equals(packageName)) {
             return new QqMusicRules();
         }
+        if (AdaptedApps.PKG_UCBROWSER.equals(packageName)) {
+            return new UcBrowserRules();
+        }
         return null;
     }
 }
