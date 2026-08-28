@@ -14,6 +14,7 @@ import android.widget.Toast;
 
 import java.util.Map;
 
+import com.litiansuo.purifier.BuildConfig;
 import com.litiansuo.purifier.R;
 import com.litiansuo.purifier.core.AdaptedApps;
 
@@ -28,6 +29,7 @@ import io.github.libxposed.service.XposedService;
 public final class MainActivity extends android.app.Activity implements ServiceBridge.Callback {
 
     private TextView statusView;
+    private TextView versionView;
     private LinearLayout listContainer;
     private final Map<String, Switch> switches = new java.util.LinkedHashMap<>();
 
@@ -36,6 +38,7 @@ public final class MainActivity extends android.app.Activity implements ServiceB
         super.onCreate(savedInstanceState);
         setContentView(buildContentView());
         ServiceBridge.get().attach(this);
+        checkUpdate();
     }
 
     @Override
@@ -62,6 +65,13 @@ public final class MainActivity extends android.app.Activity implements ServiceB
         hint.setTextColor(Color.GRAY);
         hint.setPadding(0, dp(8), 0, 0);
         root.addView(hint);
+
+        versionView = new TextView(this);
+        versionView.setTextSize(12f);
+        versionView.setTextColor(Color.GRAY);
+        versionView.setPadding(0, dp(4), 0, 0);
+        versionView.setText(getString(R.string.current_version, BuildConfig.VERSION_NAME));
+        root.addView(versionView);
 
         TextView section = new TextView(this);
         section.setText(R.string.section_targets);
@@ -176,6 +186,103 @@ public final class MainActivity extends android.app.Activity implements ServiceB
         for (Switch sw : switches.values()) {
             sw.setEnabled(false);
         }
+    }
+
+    // ---------------------------------------------------------- 更新检查
+
+    private static final String RELEASE_API =
+            "https://api.github.com/repos/1012127092/LiTianSuo/releases/latest";
+
+    private void checkUpdate() {
+        new Thread(() -> {
+            try {
+                java.net.URL url = new java.net.URL(RELEASE_API);
+                java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+                conn.setConnectTimeout(8000);
+                conn.setReadTimeout(8000);
+                conn.setRequestProperty("Accept", "application/vnd.github+json");
+                if (conn.getResponseCode() != 200) {
+                    conn.disconnect();
+                    return;
+                }
+                java.io.InputStream is = conn.getInputStream();
+                byte[] buf = new byte[8192];
+                int n;
+                StringBuilder sb = new StringBuilder();
+                while ((n = is.read(buf)) > 0) {
+                    sb.append(new String(buf, 0, n));
+                }
+                is.close();
+                conn.disconnect();
+
+                String body = sb.toString();
+                String tag = extractJsonString(body, "tag_name");
+                String downloadUrl = extractJsonString(body, "browser_download_url");
+                if (tag == null) {
+                    return;
+                }
+                String remoteVer = tag.startsWith("v") ? tag.substring(1) : tag;
+                if (isNewer(remoteVer, BuildConfig.VERSION_NAME)) {
+                    runOnUiThread(() -> {
+                        versionView.setText(getString(R.string.update_available, remoteVer));
+                        versionView.setTextColor(Color.parseColor("#1976D2"));
+                        if (downloadUrl != null) {
+                            versionView.setOnClickListener(v -> {
+                                try {
+                                    android.content.Intent i = new android.content.Intent(
+                                            android.content.Intent.ACTION_VIEW,
+                                            android.net.Uri.parse(downloadUrl));
+                                    i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                                    startActivity(i);
+                                } catch (Exception e) {
+                                    toast(getString(R.string.update_open_failed));
+                                }
+                            });
+                        }
+                    });
+                } else {
+                    runOnUiThread(() ->
+                            versionView.append("  ·  " + getString(R.string.update_latest)));
+                }
+            } catch (Exception e) {
+                // 网络异常静默忽略，不影响模块使用
+            }
+        }).start();
+    }
+
+    private static String extractJsonString(String json, String key) {
+        String pat = "\"" + key + "\":\"";
+        int s = json.indexOf(pat);
+        if (s < 0) {
+            return null;
+        }
+        s += pat.length();
+        int e = json.indexOf("\"", s);
+        if (e < 0) {
+            return null;
+        }
+        return json.substring(s, e);
+    }
+
+    private static boolean isNewer(String remote, String local) {
+        try {
+            String[] r = remote.split("\\.");
+            String[] l = local.split("\\.");
+            int len = Math.max(r.length, l.length);
+            for (int i = 0; i < len; i++) {
+                int ri = i < r.length ? Integer.parseInt(r[i]) : 0;
+                int li = i < l.length ? Integer.parseInt(l[i]) : 0;
+                if (ri > li) {
+                    return true;
+                }
+                if (ri < li) {
+                    return false;
+                }
+            }
+        } catch (Exception e) {
+            return false;
+        }
+        return false;
     }
 
     // ------------------------------------------------------------------ 工具

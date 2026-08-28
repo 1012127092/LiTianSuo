@@ -2,6 +2,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- 检查 GitHub Release 更新需要联网。 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <!-- 只查询本模块已适配的应用是否安装。
          不申请 QUERY_ALL_PACKAGES：模块只对已适配的固定应用生效，
          没有理由读取全机应用列表。新增适配应用时在此追加一行。 -->
